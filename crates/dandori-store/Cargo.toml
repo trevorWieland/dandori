@@ -1,5 +1,6 @@
 [package]
 name = "dandori-store"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,6 +10,16 @@ publish = false
 workspace = true
 
 [dependencies]
-thiserror = { workspace = true }
+chrono = { workspace = true }
+dandori-domain = { path = "../dandori-domain", version = "0.1.0" }
+sea-orm-migration = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+tokio = { workspace = true }

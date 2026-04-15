@@ -1,22 +1,79 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-pub struct EntityId(pub uuid::Uuid);
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use uuid::Uuid;
 
-impl EntityId {
-    #[must_use]
-    pub fn new() -> Self {
-        Self(uuid::Uuid::now_v7())
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueStateCategoryDto {
+    Open,
+    Active,
+    Done,
+    Cancelled,
 }
 
-impl Default for EntityId {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssuePriorityDto {
+    Low,
+    Medium,
+    High,
+    Urgent,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum CrateError {
-    #[error("not implemented")]
-    NotImplemented,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueDto {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub project_id: Uuid,
+    pub milestone_id: Option<Uuid>,
+    pub title: String,
+    pub description: Option<String>,
+    pub state_category: IssueStateCategoryDto,
+    pub priority: IssuePriorityDto,
+    pub archived_at: Option<DateTime<Utc>>,
+    pub row_version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateIssueRequest {
+    pub idempotency_key: String,
+    pub project_id: Uuid,
+    pub milestone_id: Option<Uuid>,
+    pub title: String,
+    pub description: Option<String>,
+    pub priority: IssuePriorityDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateIssueResponse {
+    pub issue: IssueDto,
+    pub idempotent_replay: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetIssueResponse {
+    pub issue: IssueDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorEnvelope {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Envelope<T> {
+    Ok { data: T },
+    Err { error: ErrorEnvelope },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("transport error: {code}: {message}")]
+pub struct TransportError {
+    pub code: String,
+    pub message: String,
 }

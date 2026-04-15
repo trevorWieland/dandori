@@ -22,6 +22,13 @@
 
 - Single required gate job: `quality-gate`
 - Workflow runs `just ci`
+- Phase 1 deep checks run via `just phase1-gate` (included in `just ci`)
+
+## Local Bootstrap
+
+- Run `just bootstrap` on a clean clone
+- Verify hooks with `lefthook run pre-commit`
+- Validate full quality gate with `just ci`
 
 ## Process Scaffolding
 

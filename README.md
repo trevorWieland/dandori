@@ -4,15 +4,33 @@ Dandori is a multi-tenant, agent-first project management control plane.
 
 ## Repository Status
 
-This repository is the v0 scaffold for the Rust-first rewrite.
+This repository contains the Phase 1 domain/store/API+MCP vertical slice for the Rust-first rewrite.
 
-## Quality Gate
+## Bootstrap (Clean Clone)
+
+```bash
+just bootstrap
+```
+
+This installs core tooling and activates git hooks via `lefthook install` when available.
+
+## Quality Gates
 
 Run the canonical gate locally:
 
 ```bash
 just ci
 ```
+
+Run the phase-specific gate directly:
+
+```bash
+just phase1-gate
+```
+
+## Database Prerequisites
+
+Phase 1 integration tests require Docker (for ephemeral PostgreSQL testcontainers).
 
 ## Workspace Layout
 
