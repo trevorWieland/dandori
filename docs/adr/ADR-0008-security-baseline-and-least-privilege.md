@@ -16,6 +16,8 @@ Enforce zero-trust security baseline:
 - `secrecy` wrappers for sensitive values.
 - Immutable mutation/activity trails.
 - No `BYPASSRLS`.
+- Fail-closed startup posture for API and MCP: no fallback local JWT secrets.
+- Shared auth validator implementation across transports to prevent policy drift.
 
 ## Consequences
 

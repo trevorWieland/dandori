@@ -14,3 +14,4 @@ anyhow = { workspace = true }
 dandori-app-services = { path = "../../crates/dandori-app-services", version = "0.1.0" }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

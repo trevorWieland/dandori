@@ -10,7 +10,8 @@ Dandori needs maintainable persistence defaults plus high-performance query path
 ## Decision
 
 Use SeaORM as the primary persistence and migration framework.
-Use targeted `sqlx` modules as explicit escape hatches for hot-path graph/CTE queries.
+Use targeted `sqlx` modules as explicit escape hatches for SQL paths SeaORM cannot express cleanly (for example: RLS session context, outbox lease/poll with `FOR UPDATE SKIP LOCKED`, and targeted fault-injection probes).
+When using raw SQL escape hatches, enforce compile-time query checking with SQLx metadata in CI.
 
 ## Consequences
 

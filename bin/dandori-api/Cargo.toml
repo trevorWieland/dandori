@@ -12,10 +12,10 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true }
+dandori-auth = { path = "../../crates/dandori-auth", version = "0.1.0" }
 dandori-app-services = { path = "../../crates/dandori-app-services", version = "0.1.0" }
 dandori-contract = { path = "../../crates/dandori-contract", version = "0.1.0" }
-jsonwebtoken = { workspace = true }
-serde = { workspace = true }
+secrecy = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 tracing-subscriber = { workspace = true }

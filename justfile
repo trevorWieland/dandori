@@ -41,6 +41,7 @@ test *args:
 phase1-gate:
     @{{ cargo }} nextest run -p dandori-store --profile ci --no-tests=pass
     @{{ cargo }} nextest run -p dandori-app-services --profile ci --no-tests=pass
+    @{{ cargo }} nextest run -p dandori-mcp --profile ci --no-tests=pass
 
 coverage:
     @{{ cargo }} llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass

@@ -3,6 +3,7 @@ members = [
   "bin/dandori-api",
   "bin/dandori-mcp",
   "bin/dandori-worker",
+  "crates/dandori-auth",
   "crates/dandori-domain",
   "crates/dandori-contract",
   "crates/dandori-policy",
@@ -92,6 +93,9 @@ tokio = { version = "1", features = [
   "time",
   "signal",
   "net",
+  "io-util",
+  "io-std",
+  "process",
 ] }
 tower = "0.5"
 tracing = "0.1"
@@ -102,5 +106,5 @@ uuid = { version = "1", features = ["v7", "serde"] }
 insta = { version = "1", features = ["yaml"] }
 proptest = "1"
 wiremock = "0.6"
-testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["postgres"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }

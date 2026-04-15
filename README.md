@@ -28,6 +28,32 @@ Run the phase-specific gate directly:
 just phase1-gate
 ```
 
+## OIDC/JWKS Configuration (Required)
+
+API and MCP now run in strict fail-closed mode and require OIDC/JWKS configuration.
+
+Required environment variables:
+
+- `DANDORI_OIDC_ISSUER`
+- `DANDORI_OIDC_AUDIENCE`
+- exactly one of:
+  - `DANDORI_OIDC_JWKS_PATH`
+  - `DANDORI_OIDC_JWKS_URL`
+
+No fallback dev secrets are enabled.
+
+## MCP Runtime
+
+`dandori-mcp` is a long-running stdio JSON-RPC server.
+
+Example request flow:
+
+1. Send `initialize`
+2. Send `tools/list`
+3. Send `tools/call` (`issue.create`, `issue.get`) with:
+   - `token` (bearer JWT)
+   - `arguments` (tool payload)
+
 ## Database Prerequisites
 
 Phase 1 integration tests require Docker (for ephemeral PostgreSQL testcontainers).
