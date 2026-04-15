@@ -1,6 +1,8 @@
 [workspace]
 members = [
   "bin/dandori-api",
+  "bin/dandori-deps-check",
+  "bin/dandori-migrate",
   "bin/dandori-mcp",
   "bin/dandori-worker",
   "crates/dandori-auth",

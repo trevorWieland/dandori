@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
@@ -75,19 +76,22 @@ pub fn build_router(state: ApiState) -> Router {
 async fn rest_create_issue(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
-    Json(request): Json<dandori_contract::CreateIssueRequest>,
+    body: Bytes,
 ) -> (StatusCode, Json<Envelope<CreateIssueResponse>>) {
     let auth = match state.auth_context(&headers) {
         Ok(auth) => auth,
         Err((status, message)) => {
-            return (
-                status,
-                Json(Envelope::Err {
-                    error: dandori_contract::ErrorEnvelope {
-                        code: "unauthorized".to_owned(),
-                        message,
-                    },
-                }),
+            return transport_err(status, "unauthorized", message);
+        }
+    };
+
+    let request = match serde_json::from_slice::<dandori_contract::CreateIssueRequest>(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return transport_err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_payload",
+                format!("invalid request payload: {error}"),
             );
         }
     };
@@ -102,19 +106,22 @@ async fn rest_create_issue(
 async fn rest_get_issue(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
-    Path(issue_id): Path<Uuid>,
+    Path(issue_id): Path<String>,
 ) -> (StatusCode, Json<Envelope<GetIssueResponse>>) {
     let auth = match state.auth_context(&headers) {
         Ok(auth) => auth,
         Err((status, message)) => {
-            return (
-                status,
-                Json(Envelope::Err {
-                    error: dandori_contract::ErrorEnvelope {
-                        code: "unauthorized".to_owned(),
-                        message,
-                    },
-                }),
+            return transport_err(status, "unauthorized", message);
+        }
+    };
+
+    let issue_id = match Uuid::parse_str(issue_id.as_str()) {
+        Ok(issue_id) => issue_id,
+        Err(error) => {
+            return transport_err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_issue_id",
+                format!("issue_id must be a valid UUID: {error}"),
             );
         }
     };
@@ -123,5 +130,21 @@ async fn rest_get_issue(
     (
         StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         Json(envelope),
+    )
+}
+
+fn transport_err<T>(
+    status: StatusCode,
+    code: &str,
+    message: String,
+) -> (StatusCode, Json<Envelope<T>>) {
+    (
+        status,
+        Json(Envelope::Err {
+            error: dandori_contract::ErrorEnvelope {
+                code: code.to_owned(),
+                message,
+            },
+        }),
     )
 }

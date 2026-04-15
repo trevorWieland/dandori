@@ -10,6 +10,9 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url = std::env::var("DANDORI_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let run_migrations = std::env::var("DANDORI_RUN_MIGRATIONS")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
 
     let workspace_id = std::env::var("DANDORI_WORKER_WORKSPACE_ID")
         .context("DANDORI_WORKER_WORKSPACE_ID is required")
@@ -38,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         idempotency_retention_hours: 168,
     };
 
-    let worker = build_outbox_worker_service(&database_url, true, config).await?;
+    let worker = build_outbox_worker_service(&database_url, run_migrations, config).await?;
 
     loop {
         tokio::select! {

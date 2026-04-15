@@ -1,6 +1,7 @@
 mod support;
 
 use chrono::{Duration, Utc};
+use dandori_store::StoreError;
 use sqlx::query;
 use uuid::Uuid;
 
@@ -9,7 +10,7 @@ use support::{auth_context, make_command, make_event, setup_db};
 #[tokio::test]
 async fn outbox_lease_retry_dead_letter_and_retention_flow() {
     let db = setup_db().await;
-    let _ = (db.workspace_b, db.workflow_a);
+    let _ = (db._workspace_b, db._workflow_a);
 
     let command = make_command(
         db.workspace_a,
@@ -93,14 +94,14 @@ async fn outbox_lease_retry_dead_letter_and_retention_flow() {
 #[tokio::test]
 async fn idempotency_cleanup_deletes_expired_rows() {
     let db = setup_db().await;
-    let _ = (db.workspace_b, db.workflow_a);
+    let _ = (db._workspace_b, db._workflow_a);
 
     query(
         "INSERT INTO idempotency_record (
             workspace_id,
             command_name,
             idempotency_key,
-            command_id,
+            request_fingerprint,
             response_payload,
             expires_at,
             created_at
@@ -109,7 +110,7 @@ async fn idempotency_cleanup_deletes_expired_rows() {
     .bind(db.workspace_a)
     .bind("issue.create.v1")
     .bind("expired-key")
-    .bind(Uuid::now_v7())
+    .bind("expired-fingerprint")
     .bind(Utc::now() - Duration::days(1))
     .bind(Utc::now() - Duration::days(2))
     .execute(&db.admin_pool)
@@ -125,4 +126,59 @@ async fn idempotency_cleanup_deletes_expired_rows() {
         .expect("cleanup idempotency");
 
     assert_eq!(deleted, 1);
+}
+
+#[tokio::test]
+async fn outbox_status_updates_require_matching_workspace_and_row() {
+    let db = setup_db().await;
+
+    let command = make_command(
+        db.workspace_a,
+        db.project_a,
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        "idem-outbox-workspace-check",
+    );
+    let event = make_event(&command);
+    let auth_a = auth_context(db.workspace_a, command.actor_id);
+    let auth_b = auth_context(db._workspace_b, Uuid::now_v7());
+
+    db.app_store
+        .create_issue_transactional(&auth_a, &command, &event)
+        .await
+        .expect("create issue");
+
+    let leased = db
+        .app_store
+        .lease_outbox_batch(&auth_a, Utc::now(), Duration::seconds(30), 10)
+        .await
+        .expect("lease");
+
+    let outbox_id = leased[0].id;
+    let delivered_err = db
+        .app_store
+        .mark_outbox_delivered(&auth_b, outbox_id, Utc::now())
+        .await
+        .expect_err("cross-workspace delivery update should fail");
+    assert!(matches!(
+        delivered_err,
+        StoreError::OutboxUpdateNotSingleRow { .. }
+    ));
+
+    let failed_err = db
+        .app_store
+        .mark_outbox_failed(
+            &auth_b,
+            outbox_id,
+            Utc::now(),
+            "cross workspace",
+            3,
+            Duration::seconds(0),
+        )
+        .await
+        .expect_err("cross-workspace failure update should fail");
+    assert!(matches!(
+        failed_err,
+        StoreError::OutboxUpdateNotSingleRow { .. }
+    ));
 }

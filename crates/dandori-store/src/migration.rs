@@ -25,6 +25,7 @@ CREATE TABLE workflow_version (
     states jsonb NOT NULL DEFAULT '[]'::jsonb,
     transitions jsonb NOT NULL DEFAULT '[]'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
     UNIQUE (workspace_id, name, version)
 );
 
@@ -32,28 +33,34 @@ CREATE TABLE project (
     id uuid PRIMARY KEY,
     workspace_id uuid NOT NULL REFERENCES workspace(id),
     name text NOT NULL,
-    workflow_version_id uuid NOT NULL REFERENCES workflow_version(id),
+    workflow_version_id uuid NOT NULL,
     row_version bigint NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now()
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
+    FOREIGN KEY (workspace_id, workflow_version_id)
+        REFERENCES workflow_version (workspace_id, id)
 );
 
 CREATE TABLE milestone (
     id uuid PRIMARY KEY,
     workspace_id uuid NOT NULL REFERENCES workspace(id),
-    project_id uuid NOT NULL REFERENCES project(id),
+    project_id uuid NOT NULL,
     title text NOT NULL,
     due_at timestamptz,
     row_version bigint NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now()
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
+    FOREIGN KEY (workspace_id, project_id)
+        REFERENCES project (workspace_id, id)
 );
 
 CREATE TABLE issue (
     id uuid PRIMARY KEY,
     workspace_id uuid NOT NULL REFERENCES workspace(id),
-    project_id uuid NOT NULL REFERENCES project(id),
-    milestone_id uuid REFERENCES milestone(id),
+    project_id uuid NOT NULL,
+    milestone_id uuid,
     title text NOT NULL,
     description text,
     state_category issue_state_category NOT NULL,
@@ -61,7 +68,12 @@ CREATE TABLE issue (
     archived_at timestamptz,
     row_version bigint NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now()
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, id),
+    FOREIGN KEY (workspace_id, project_id)
+        REFERENCES project (workspace_id, id),
+    FOREIGN KEY (workspace_id, milestone_id)
+        REFERENCES milestone (workspace_id, id)
 );
 "#;
 
@@ -80,13 +92,17 @@ const CREATE_ACTIVITY_OUTBOX_AND_IDEMPOTENCY_SQL: &str = r#"
 CREATE TABLE activity (
     id uuid PRIMARY KEY,
     workspace_id uuid NOT NULL REFERENCES workspace(id),
-    project_id uuid NOT NULL REFERENCES project(id),
-    issue_id uuid REFERENCES issue(id),
+    project_id uuid NOT NULL,
+    issue_id uuid,
     command_id uuid NOT NULL,
     actor_id uuid NOT NULL,
     event_type text NOT NULL,
     event_payload jsonb NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now()
+    created_at timestamptz NOT NULL DEFAULT now(),
+    FOREIGN KEY (workspace_id, project_id)
+        REFERENCES project (workspace_id, id),
+    FOREIGN KEY (workspace_id, issue_id)
+        REFERENCES issue (workspace_id, id)
 );
 
 CREATE TABLE outbox (
@@ -114,7 +130,7 @@ CREATE TABLE idempotency_record (
     workspace_id uuid NOT NULL REFERENCES workspace(id),
     command_name text NOT NULL,
     idempotency_key text NOT NULL,
-    command_id uuid NOT NULL,
+    request_fingerprint text NOT NULL,
     response_payload jsonb NOT NULL,
     expires_at timestamptz NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -141,10 +157,17 @@ CREATE INDEX idx_outbox_lease_expiry ON outbox(status, leased_until)
     WHERE status = 'leased';
 CREATE INDEX idx_outbox_retention ON outbox(status, published_at, updated_at);
 CREATE INDEX idx_idempotency_expires_at ON idempotency_record(expires_at);
+CREATE INDEX idx_idempotency_fingerprint ON idempotency_record(
+    workspace_id,
+    command_name,
+    idempotency_key,
+    request_fingerprint
+);
 "#;
 
 const DROP_INDEXES_SQL: &str = r#"
 DROP INDEX IF EXISTS idx_idempotency_expires_at;
+DROP INDEX IF EXISTS idx_idempotency_fingerprint;
 DROP INDEX IF EXISTS idx_outbox_retention;
 DROP INDEX IF EXISTS idx_outbox_lease_expiry;
 DROP INDEX IF EXISTS idx_outbox_poll_pending;

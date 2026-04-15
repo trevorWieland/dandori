@@ -28,7 +28,7 @@ struct IssueRow {
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct IdempotencyRow {
-    command_id: Uuid,
+    request_fingerprint: String,
     response_payload: serde_json::Value,
 }
 
@@ -42,7 +42,7 @@ pub(crate) async fn create_issue_transactional(
     set_workspace_context_tx(&mut tx, auth.workspace_id.0).await?;
 
     let maybe_idempotency = sqlx::query_as::<_, IdempotencyRow>(
-        "SELECT command_id, response_payload
+        "SELECT request_fingerprint, response_payload
          FROM idempotency_record
          WHERE workspace_id = $1 AND command_name = $2 AND idempotency_key = $3",
     )
@@ -53,18 +53,13 @@ pub(crate) async fn create_issue_transactional(
     .await?;
 
     if let Some(existing) = maybe_idempotency {
-        if existing.command_id != command.command_id.0 {
+        if existing.request_fingerprint != command.request_fingerprint {
             return Err(StoreError::IdempotencyConflict);
         }
-
         let replay: IdempotencyResponse = serde_json::from_value(existing.response_payload)?;
-        let issue = fetch_issue_in_tx(&mut tx, replay.issue_id)
-            .await?
-            .ok_or(StoreError::IdempotencyReplayMissingIssue)?;
         tx.commit().await?;
-
         return Ok(CreateIssueWriteResult {
-            issue,
+            issue: replay.issue,
             idempotent_replay: true,
         });
     }
@@ -80,9 +75,24 @@ pub(crate) async fn create_issue_transactional(
     .bind(command.workspace_id.0)
     .fetch_one(tx.as_mut())
     .await?;
-
     if !project_exists {
         return Err(StoreError::ProjectNotFound);
+    }
+
+    if let Some(milestone_id) = command.milestone_id {
+        let milestone_project: Option<Uuid> = sqlx::query_scalar(
+            "SELECT project_id
+             FROM milestone
+             WHERE id = $1 AND workspace_id = $2",
+        )
+        .bind(milestone_id.0)
+        .bind(command.workspace_id.0)
+        .fetch_optional(tx.as_mut())
+        .await?;
+        let milestone_project = milestone_project.ok_or(StoreError::MilestoneNotFound)?;
+        if milestone_project != command.project_id.0 {
+            return Err(StoreError::MilestoneProjectMismatch);
+        }
     }
 
     sqlx::query(
@@ -204,12 +214,16 @@ pub(crate) async fn create_issue_transactional(
     .execute(tx.as_mut())
     .await?;
 
+    let issue = fetch_issue_in_tx(&mut tx, command.issue_id.0)
+        .await?
+        .ok_or(StoreError::IdempotencyReplayMissingIssue)?;
+
     sqlx::query(
         "INSERT INTO idempotency_record (
             workspace_id,
             command_name,
             idempotency_key,
-            command_id,
+            request_fingerprint,
             response_payload,
             expires_at,
             created_at
@@ -218,18 +232,14 @@ pub(crate) async fn create_issue_transactional(
     .bind(command.workspace_id.0)
     .bind("issue.create.v1")
     .bind(command.idempotency_key.as_str())
-    .bind(command.command_id.0)
+    .bind(command.request_fingerprint.as_str())
     .bind(json!(IdempotencyResponse {
-        issue_id: command.issue_id.0,
+        issue: issue.clone(),
     }))
     .bind(Utc::now() + Duration::days(7))
     .bind(Utc::now())
     .execute(tx.as_mut())
     .await?;
-
-    let issue = fetch_issue_in_tx(&mut tx, command.issue_id.0)
-        .await?
-        .ok_or(StoreError::IdempotencyReplayMissingIssue)?;
 
     tx.commit().await?;
 

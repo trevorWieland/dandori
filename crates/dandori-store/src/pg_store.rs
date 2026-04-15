@@ -2,7 +2,7 @@ use chrono::{DateTime, Duration, Utc};
 use dandori_domain::{
     AuthContext, CreateIssueCommandV1, DomainError, Issue, IssueCreatedEventV1, Project, Workspace,
 };
-use sea_orm::{Database, DatabaseConnection};
+use sea_orm::{DatabaseConnection, SqlxPostgresConnector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -60,6 +60,12 @@ pub enum StoreError {
     Serde(#[from] serde_json::Error),
     #[error("project not found")]
     ProjectNotFound,
+    #[error("workflow version not found")]
+    WorkflowVersionNotFound,
+    #[error("milestone not found")]
+    MilestoneNotFound,
+    #[error("milestone project mismatch")]
+    MilestoneProjectMismatch,
     #[error("idempotency conflict")]
     IdempotencyConflict,
     #[error("idempotency replay payload missing target issue")]
@@ -68,13 +74,21 @@ pub enum StoreError {
     InvalidState(String),
     #[error("invalid priority in database: {0}")]
     InvalidPriority(String),
+    #[error(
+        "outbox state update expected exactly one row for id '{outbox_id}' in workspace '{workspace_id}', updated {rows_affected}"
+    )]
+    OutboxUpdateNotSingleRow {
+        workspace_id: Uuid,
+        outbox_id: Uuid,
+        rows_affected: u64,
+    },
     #[error("domain violation: {0}")]
     Domain(#[from] DomainError),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct IdempotencyResponse {
-    pub issue_id: Uuid,
+    pub issue: Issue,
 }
 
 impl PgStore {
@@ -85,7 +99,7 @@ impl PgStore {
 
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
         let pool = PgPool::connect(database_url).await?;
-        let db = Database::connect(database_url).await?;
+        let db = SqlxPostgresConnector::from_sqlx_postgres_pool(pool.clone());
         Ok(Self { pool, db })
     }
 

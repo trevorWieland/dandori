@@ -15,9 +15,10 @@ pub(crate) struct TestDatabase {
     pub admin_pool: PgPool,
     pub app_store: PgStore,
     pub workspace_a: Uuid,
-    pub workspace_b: Uuid,
-    pub workflow_a: Uuid,
+    pub _workspace_b: Uuid,
+    pub _workflow_a: Uuid,
     pub project_a: Uuid,
+    pub _project_b: Uuid,
 }
 
 pub(crate) async fn setup_db() -> TestDatabase {
@@ -113,9 +114,10 @@ pub(crate) async fn setup_db() -> TestDatabase {
         admin_pool,
         app_store,
         workspace_a,
-        workspace_b,
-        workflow_a,
+        _workspace_b: workspace_b,
+        _workflow_a: workflow_a,
         project_a,
+        _project_b: project_b,
     }
 }
 
@@ -129,6 +131,7 @@ pub(crate) fn make_command(
     CreateIssueCommandV1 {
         command_id: CommandId(command_id),
         idempotency_key: IdempotencyKey(idempotency_key.to_owned()),
+        request_fingerprint: format!("fingerprint:{workspace_id}:{project_id}:{idempotency_key}"),
         issue_id: IssueId(issue_id),
         workspace_id: workspace_id.into(),
         project_id: project_id.into(),

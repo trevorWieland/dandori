@@ -46,9 +46,11 @@ impl IssueAppService {
         auth: &AuthContext,
         request: CreateIssueRequest,
     ) -> Result<CreateIssueResponse, AppServiceError> {
+        let request_fingerprint = create_issue_fingerprint(&request);
         let command = CreateIssueCommandV1 {
             command_id: CommandId(Uuid::now_v7()),
             idempotency_key: dandori_domain::IdempotencyKey(request.idempotency_key),
+            request_fingerprint,
             issue_id: IssueId::new(),
             workspace_id: auth.workspace_id,
             project_id: request.project_id.into(),
@@ -149,6 +151,16 @@ impl IssueAppService {
             StoreError::ProjectNotFound => {
                 Self::map_domain_error(command.map_missing_project_precondition())
             }
+            StoreError::MilestoneNotFound => AppServiceError {
+                code: "milestone_not_found",
+                message: "milestone not found in workspace".to_owned(),
+                kind: ErrorKind::Precondition,
+            },
+            StoreError::MilestoneProjectMismatch => AppServiceError {
+                code: "milestone_project_mismatch",
+                message: "milestone does not belong to the requested project".to_owned(),
+                kind: ErrorKind::Precondition,
+            },
             StoreError::IdempotencyConflict => {
                 Self::map_domain_error(command.map_duplicate_conflict())
             }
@@ -256,5 +268,27 @@ pub fn validation_error(code: &'static str, message: String) -> AppServiceError 
         code,
         message,
         kind: ErrorKind::Validation,
+    }
+}
+
+fn create_issue_fingerprint(request: &CreateIssueRequest) -> String {
+    format!(
+        "project_id={}|milestone_id={}|title={}|description={}|priority={}",
+        request.project_id,
+        request
+            .milestone_id
+            .map_or_else(|| "null".to_owned(), |id| id.to_string()),
+        request.title,
+        request.description.clone().unwrap_or_default(),
+        priority_literal(request.priority),
+    )
+}
+
+fn priority_literal(priority: IssuePriorityDto) -> &'static str {
+    match priority {
+        IssuePriorityDto::Low => "low",
+        IssuePriorityDto::Medium => "medium",
+        IssuePriorityDto::High => "high",
+        IssuePriorityDto::Urgent => "urgent",
     }
 }

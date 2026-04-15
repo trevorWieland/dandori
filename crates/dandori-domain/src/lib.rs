@@ -3,6 +3,10 @@
 //! Versioned command/event boundaries:
 //! - [`IssueCommandV1`]
 //! - [`IssueEventV1`]
+//! - [`WorkspaceCommandV1`]
+//! - [`WorkspaceEventV1`]
+//! - [`ProjectCommandV1`]
+//! - [`ProjectEventV1`]
 
 mod auth;
 mod command;
@@ -12,12 +16,18 @@ mod ids;
 mod model;
 
 pub use auth::AuthContext;
-pub use command::{CreateIssueCommandV1, IssueCommandV1};
+pub use command::{
+    CreateIssueCommandV1, CreateProjectCommandV1, CreateWorkspaceCommandV1, IssueCommandV1,
+    ProjectCommandV1, WorkspaceCommandV1,
+};
 pub use error::{
     AuthzError, ConflictError, DomainError, InfrastructureError, PreconditionError,
     TenantBoundaryError, ValidationError,
 };
-pub use event::{IssueCreatedEventV1, IssueEventV1};
+pub use event::{
+    IssueCreatedEventV1, IssueEventV1, ProjectCreatedEventV1, ProjectEventV1,
+    WorkspaceCreatedEventV1, WorkspaceEventV1,
+};
 pub use ids::{
     ActivityId, CommandId, IdempotencyKey, IssueId, MilestoneId, OutboxId, ProjectId, WorkspaceId,
 };

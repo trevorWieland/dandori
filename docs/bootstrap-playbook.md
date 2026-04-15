@@ -28,11 +28,15 @@
 
 - Run `just bootstrap` on a clean clone
 - Verify hooks with `lefthook run pre-commit`
+- Run schema migration via `just db-migrate` when preparing a local runtime database
 - Validate full quality gate with `just ci`
 - Configure strict auth env for API/MCP runtime:
   - `DANDORI_OIDC_ISSUER`
   - `DANDORI_OIDC_AUDIENCE`
   - one JWKS source (`DANDORI_OIDC_JWKS_PATH` or `DANDORI_OIDC_JWKS_URL`)
+  - optional algorithm allowlist (`DANDORI_OIDC_ALLOWED_ALGS`, comma-separated)
+- Runtime migration policy defaults to disabled:
+  - set `DANDORI_RUN_MIGRATIONS=true` only for intentional local startup-migration workflows
 
 ## Process Scaffolding
 

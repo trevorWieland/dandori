@@ -1,9 +1,9 @@
 use chrono::Utc;
 use dandori_domain::{AuthContext, Project};
-use sea_orm::{ActiveModelTrait, EntityTrait, Set, TransactionTrait};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use uuid::Uuid;
 
-use crate::entities::project;
+use crate::entities::{project, workflow_version};
 use crate::pg_store::{PgStore, ProjectWriteInput};
 use crate::{StoreError, repositories::common::set_workspace_context_db};
 
@@ -14,6 +14,16 @@ pub(crate) async fn create_project(
 ) -> Result<Project, StoreError> {
     let tx = store.db().begin().await?;
     set_workspace_context_db(&tx, auth.workspace_id.0).await?;
+
+    let workflow_exists = workflow_version::Entity::find()
+        .filter(workflow_version::Column::WorkspaceId.eq(input.workspace_id))
+        .filter(workflow_version::Column::Id.eq(input.workflow_version_id))
+        .one(&tx)
+        .await?
+        .is_some();
+    if !workflow_exists {
+        return Err(StoreError::WorkflowVersionNotFound);
+    }
 
     let model = project::ActiveModel {
         id: Set(input.project_id),

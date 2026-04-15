@@ -1,0 +1,16 @@
+[package]
+name = "dandori-migrate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+dandori-store = { path = "../../crates/dandori-store", version = "0.1.0" }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

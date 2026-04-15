@@ -1,7 +1,11 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use dandori_domain::AuthContext;
-use dandori_store::{PgStore, migrate_database};
+use dandori_domain::{AuthContext, IssueCreatedEventV1};
+use dandori_store::{OutboxMessage, PgStore, migrate_database};
 use thiserror::Error;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{AppServiceError, ErrorKind};
@@ -45,22 +49,140 @@ pub struct WorkerRunReport {
     pub cleaned_idempotency_rows: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishErrorKind {
+    Transient,
+    Permanent,
+    Unsupported,
+    Serialization,
+}
+
 #[derive(Debug, Error)]
-enum WorkerError {
-    #[error("unsupported outbox event type '{0}'")]
-    UnsupportedEvent(String),
+#[error("{kind:?}: {message}")]
+pub struct PublishError {
+    pub kind: PublishErrorKind,
+    pub message: String,
+}
+
+#[async_trait]
+pub trait OutboxPublisher: Send + Sync {
+    async fn publish_issue_created(
+        &self,
+        message: &OutboxMessage,
+        event: &IssueCreatedEventV1,
+    ) -> Result<(), PublishError>;
 }
 
 #[derive(Debug, Clone)]
+pub struct HttpOutboxPublisher {
+    client: reqwest::Client,
+    endpoint: String,
+}
+
+impl HttpOutboxPublisher {
+    #[must_use]
+    pub fn new(endpoint: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            endpoint,
+        }
+    }
+}
+
+#[async_trait]
+impl OutboxPublisher for HttpOutboxPublisher {
+    async fn publish_issue_created(
+        &self,
+        message: &OutboxMessage,
+        event: &IssueCreatedEventV1,
+    ) -> Result<(), PublishError> {
+        let response = self
+            .client
+            .post(self.endpoint.as_str())
+            .json(&serde_json::json!({
+                "event_type": "issue.created.v1",
+                "event_id": message.event_id,
+                "workspace_id": message.workspace_id,
+                "event": event,
+            }))
+            .send()
+            .await
+            .map_err(|error| PublishError {
+                kind: PublishErrorKind::Transient,
+                message: format!("http publish request failed: {error}"),
+            })?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        let kind = if status.is_server_error() {
+            PublishErrorKind::Transient
+        } else {
+            PublishErrorKind::Permanent
+        };
+
+        Err(PublishError {
+            kind,
+            message: format!("http publish rejected with status {status}: {text}"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct NoopOutboxPublisher;
+
+#[async_trait]
+impl OutboxPublisher for NoopOutboxPublisher {
+    async fn publish_issue_created(
+        &self,
+        _message: &OutboxMessage,
+        _event: &IssueCreatedEventV1,
+    ) -> Result<(), PublishError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub struct OutboxWorkerService {
     store: PgStore,
     config: OutboxWorkerConfig,
+    publisher: Arc<dyn OutboxPublisher>,
+}
+
+impl std::fmt::Debug for OutboxWorkerService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutboxWorkerService")
+            .field("store", &self.store)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OutboxWorkerService {
     #[must_use]
-    pub fn new(store: PgStore, config: OutboxWorkerConfig) -> Self {
-        Self { store, config }
+    pub fn new(
+        store: PgStore,
+        config: OutboxWorkerConfig,
+        publisher: Arc<dyn OutboxPublisher>,
+    ) -> Self {
+        Self {
+            store,
+            config,
+            publisher,
+        }
+    }
+
+    #[must_use]
+    pub fn with_default_publisher(store: PgStore, config: OutboxWorkerConfig) -> Self {
+        let publisher = if let Ok(endpoint) = std::env::var("DANDORI_OUTBOX_PUBLISH_URL") {
+            Arc::new(HttpOutboxPublisher::new(endpoint)) as Arc<dyn OutboxPublisher>
+        } else {
+            Arc::new(NoopOutboxPublisher) as Arc<dyn OutboxPublisher>
+        };
+        Self::new(store, config, publisher)
     }
 
     pub async fn run_once(&self) -> Result<WorkerRunReport, AppServiceError> {
@@ -81,34 +203,57 @@ impl OutboxWorkerService {
             .await
             .map_err(map_store_worker_error)?;
 
+        info!(
+            workspace_id = %auth.workspace_id,
+            leased = leased.len(),
+            "worker leased outbox rows"
+        );
+
         let mut report = WorkerRunReport {
             leased: leased.len(),
             ..WorkerRunReport::default()
         };
 
         for message in leased {
-            if process_outbox_event(message.event_type.as_str(), &message.payload).is_ok() {
-                self.store
-                    .mark_outbox_delivered(&auth, message.id, Utc::now())
-                    .await
-                    .map_err(map_store_worker_error)?;
-                report.delivered += 1;
-            } else {
-                let previous_attempts = message.attempts;
-                self.store
-                    .mark_outbox_failed(
-                        &auth,
-                        message.id,
-                        Utc::now(),
-                        "worker_publish_failed",
-                        self.config.max_attempts,
-                        Duration::seconds(self.config.retry_backoff_seconds),
-                    )
-                    .await
-                    .map_err(map_store_worker_error)?;
-                report.failed += 1;
-                if previous_attempts + 1 >= self.config.max_attempts {
-                    report.dead_lettered += 1;
+            let previous_attempts = message.attempts;
+            match self.route_and_publish(&message).await {
+                Ok(()) => {
+                    self.store
+                        .mark_outbox_delivered(&auth, message.id, Utc::now())
+                        .await
+                        .map_err(map_store_worker_error)?;
+                    report.delivered += 1;
+                    info!(
+                        outbox_id = %message.id,
+                        event_type = %message.event_type,
+                        "outbox message delivered"
+                    );
+                }
+                Err(error) => {
+                    self.store
+                        .mark_outbox_failed(
+                            &auth,
+                            message.id,
+                            Utc::now(),
+                            format!("{:?}: {}", error.kind, error.message).as_str(),
+                            self.config.max_attempts,
+                            Duration::seconds(self.config.retry_backoff_seconds),
+                        )
+                        .await
+                        .map_err(map_store_worker_error)?;
+
+                    report.failed += 1;
+                    if previous_attempts + 1 >= self.config.max_attempts {
+                        report.dead_lettered += 1;
+                    }
+                    warn!(
+                        outbox_id = %message.id,
+                        event_type = %message.event_type,
+                        previous_attempts,
+                        failure_kind = ?error.kind,
+                        failure = %error.message,
+                        "outbox publish failed"
+                    );
                 }
             }
         }
@@ -132,7 +277,34 @@ impl OutboxWorkerService {
             .await
             .map_err(map_store_worker_error)?;
 
+        info!(
+            leased = report.leased,
+            delivered = report.delivered,
+            failed = report.failed,
+            dead_lettered = report.dead_lettered,
+            cleaned_outbox_rows = report.cleaned_outbox_rows,
+            cleaned_idempotency_rows = report.cleaned_idempotency_rows,
+            "worker run finished"
+        );
+
         Ok(report)
+    }
+
+    async fn route_and_publish(&self, message: &OutboxMessage) -> Result<(), PublishError> {
+        match message.event_type.as_str() {
+            "issue.created.v1" => {
+                let event: IssueCreatedEventV1 = serde_json::from_value(message.payload.clone())
+                    .map_err(|error| PublishError {
+                        kind: PublishErrorKind::Serialization,
+                        message: format!("failed to deserialize issue.created payload: {error}"),
+                    })?;
+                self.publisher.publish_issue_created(message, &event).await
+            }
+            other => Err(PublishError {
+                kind: PublishErrorKind::Unsupported,
+                message: format!("unsupported outbox event type '{other}'"),
+            }),
+        }
     }
 }
 
@@ -159,17 +331,7 @@ pub async fn build_outbox_worker_service(
             kind: ErrorKind::Infrastructure,
         })?;
 
-    Ok(OutboxWorkerService::new(store, config))
-}
-
-fn process_outbox_event(event_type: &str, payload: &serde_json::Value) -> Result<(), WorkerError> {
-    match event_type {
-        "issue.created.v1" => {
-            let _ = payload;
-            Ok(())
-        }
-        _ => Err(WorkerError::UnsupportedEvent(event_type.to_owned())),
-    }
+    Ok(OutboxWorkerService::with_default_publisher(store, config))
 }
 
 fn map_store_worker_error(error: dandori_store::StoreError) -> AppServiceError {

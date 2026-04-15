@@ -61,7 +61,7 @@ impl McpSession {
 }
 
 #[tokio::test]
-async fn rest_and_mcp_wire_paths_have_parity_for_success_and_failure() {
+async fn rest_and_mcp_wire_paths_have_parity_for_retry_and_error_semantics() {
     let container = Postgres::default().start().await.expect("start postgres");
     let host = container.get_host().await.expect("host");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
@@ -158,7 +158,6 @@ async fn rest_and_mcp_wire_paths_have_parity_for_success_and_failure() {
     });
 
     let jwks_path = write_jwks_file();
-
     let mut mcp = spawn_mcp(&app_url, &jwks_path).await;
 
     let initialize = mcp
@@ -171,128 +170,189 @@ async fn rest_and_mcp_wire_paths_have_parity_for_success_and_failure() {
         .await;
     assert!(initialize.get("result").is_some());
 
-    let token = build_token(workspace_id);
-
     let rest_client = reqwest::Client::new();
-    let rest_create_request = CreateIssueRequest {
-        idempotency_key: "rest-wire-success".to_owned(),
+
+    let rest_retry_request = CreateIssueRequest {
+        idempotency_key: "rest-wire-retry".to_owned(),
         project_id,
         milestone_id: None,
-        title: "Wire parity".to_owned(),
-        description: Some("rest".to_owned()),
+        title: "Rest wire retry".to_owned(),
+        description: Some("same payload".to_owned()),
         priority: IssuePriorityDto::Medium,
     };
 
-    let rest_create = rest_client
+    let rest_retry_first = rest_client
         .post(format!("{rest_base}/v1/issues"))
-        .bearer_auth(&token)
-        .json(&rest_create_request)
+        .bearer_auth(build_token(workspace_id))
+        .json(&rest_retry_request)
         .send()
         .await
-        .expect("rest create request");
-    assert_eq!(rest_create.status(), 201);
-    let rest_create_envelope: Value = rest_create.json().await.expect("rest create json");
+        .expect("rest retry first");
+    let rest_retry_first_envelope: Value = rest_retry_first
+        .json()
+        .await
+        .expect("rest retry first json");
+    let rest_retry_first_id = rest_retry_first_envelope
+        .get("data")
+        .and_then(|data| data.get("issue"))
+        .and_then(|issue| issue.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
 
-    let mcp_create = mcp
+    let rest_retry_second = rest_client
+        .post(format!("{rest_base}/v1/issues"))
+        .bearer_auth(build_token(workspace_id))
+        .json(&rest_retry_request)
+        .send()
+        .await
+        .expect("rest retry second");
+    let rest_retry_second_envelope: Value = rest_retry_second
+        .json()
+        .await
+        .expect("rest retry second json");
+    let rest_retry_replay = rest_retry_second_envelope
+        .get("data")
+        .and_then(|data| data.get("idempotent_replay"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let rest_retry_second_id = rest_retry_second_envelope
+        .get("data")
+        .and_then(|data| data.get("issue"))
+        .and_then(|issue| issue.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    assert!(rest_retry_replay);
+    assert_eq!(rest_retry_first_id, rest_retry_second_id);
+
+    let rest_retry_conflict = rest_client
+        .post(format!("{rest_base}/v1/issues"))
+        .bearer_auth(build_token(workspace_id))
+        .json(&json!({
+            "idempotency_key": "rest-wire-retry",
+            "project_id": project_id,
+            "milestone_id": null,
+            "title": "Rest wire retry changed",
+            "description": "different payload",
+            "priority": "medium"
+        }))
+        .send()
+        .await
+        .expect("rest retry conflict");
+    assert_eq!(rest_retry_conflict.status(), 409);
+    let rest_retry_conflict_envelope: Value = rest_retry_conflict
+        .json()
+        .await
+        .expect("rest retry conflict json");
+    let rest_retry_conflict_code = rest_retry_conflict_envelope
+        .get("error")
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(rest_retry_conflict_code, "duplicate_issue_command");
+
+    let mcp_retry_first = mcp
         .send(json!({
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": 20,
             "method": "tools/call",
             "params": {
                 "name": "issue.create",
-                "token": token,
+                "token": build_token(workspace_id),
                 "arguments": {
-                    "idempotency_key": "mcp-wire-success",
+                    "idempotency_key": "mcp-wire-retry",
                     "project_id": project_id,
                     "milestone_id": null,
-                    "title": "Wire parity",
-                    "description": "mcp",
+                    "title": "MCP wire retry",
+                    "description": "same payload",
                     "priority": "medium"
                 }
             }
         }))
         .await;
-
-    let mcp_create_envelope = mcp_create
+    let mcp_retry_first_envelope = mcp_retry_first
         .get("result")
         .and_then(|value| value.get("envelope"))
         .cloned()
-        .expect("mcp create envelope");
+        .expect("mcp retry first envelope");
+    let mcp_retry_first_id = mcp_retry_first_envelope
+        .get("data")
+        .and_then(|data| data.get("issue"))
+        .and_then(|issue| issue.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
 
-    assert_eq!(
-        rest_create_envelope
-            .get("status")
-            .and_then(Value::as_str)
-            .expect("rest status"),
-        "ok"
-    );
-    assert_eq!(
-        mcp_create_envelope
-            .get("status")
-            .and_then(Value::as_str)
-            .expect("mcp status"),
-        "ok"
-    );
-
-    let missing_issue = Uuid::now_v7();
-    let rest_get_missing = rest_client
-        .get(format!("{rest_base}/v1/issues/{missing_issue}"))
-        .bearer_auth(build_token(workspace_id))
-        .send()
-        .await
-        .expect("rest missing get request");
-
-    assert_eq!(rest_get_missing.status(), 404);
-    let rest_get_missing_envelope: Value =
-        rest_get_missing.json().await.expect("rest missing json");
-
-    let mcp_get_missing = mcp
+    let mcp_retry_second = mcp
         .send(json!({
             "jsonrpc": "2.0",
-            "id": 3,
+            "id": 21,
             "method": "tools/call",
             "params": {
-                "name": "issue.get",
+                "name": "issue.create",
                 "token": build_token(workspace_id),
-                "arguments": {"issue_id": missing_issue}
+                "arguments": {
+                    "idempotency_key": "mcp-wire-retry",
+                    "project_id": project_id,
+                    "milestone_id": null,
+                    "title": "MCP wire retry",
+                    "description": "same payload",
+                    "priority": "medium"
+                }
             }
         }))
         .await;
-
-    let mcp_get_missing_envelope = mcp_get_missing
+    let mcp_retry_second_envelope = mcp_retry_second
         .get("result")
         .and_then(|value| value.get("envelope"))
         .cloned()
-        .expect("mcp missing envelope");
+        .expect("mcp retry second envelope");
+    let mcp_retry_replay = mcp_retry_second_envelope
+        .get("data")
+        .and_then(|data| data.get("idempotent_replay"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mcp_retry_second_id = mcp_retry_second_envelope
+        .get("data")
+        .and_then(|data| data.get("issue"))
+        .and_then(|issue| issue.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    assert!(mcp_retry_replay);
+    assert_eq!(mcp_retry_first_id, mcp_retry_second_id);
 
-    assert_eq!(
-        rest_get_missing_envelope
-            .get("status")
-            .and_then(Value::as_str)
-            .expect("rest missing status"),
-        "err"
-    );
-    assert_eq!(
-        mcp_get_missing_envelope
-            .get("status")
-            .and_then(Value::as_str)
-            .expect("mcp missing status"),
-        "err"
-    );
-
-    let rest_missing_code = rest_get_missing_envelope
+    let mcp_retry_conflict = mcp
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "issue.create",
+                "token": build_token(workspace_id),
+                "arguments": {
+                    "idempotency_key": "mcp-wire-retry",
+                    "project_id": project_id,
+                    "milestone_id": null,
+                    "title": "MCP wire retry changed",
+                    "description": "different payload",
+                    "priority": "medium"
+                }
+            }
+        }))
+        .await;
+    let mcp_retry_conflict_envelope = mcp_retry_conflict
+        .get("result")
+        .and_then(|value| value.get("envelope"))
+        .cloned()
+        .expect("mcp retry conflict envelope");
+    let mcp_retry_conflict_code = mcp_retry_conflict_envelope
         .get("error")
         .and_then(|value| value.get("code"))
         .and_then(Value::as_str)
-        .expect("rest missing code");
-    let mcp_missing_code = mcp_get_missing_envelope
-        .get("error")
-        .and_then(|value| value.get("code"))
-        .and_then(Value::as_str)
-        .expect("mcp missing code");
-
-    assert_eq!(rest_missing_code, "issue_not_found");
-    assert_eq!(mcp_missing_code, "issue_not_found");
+        .unwrap_or_default();
+    assert_eq!(mcp_retry_conflict_code, "duplicate_issue_command");
 
     mcp.shutdown().await;
     rest_server.abort();

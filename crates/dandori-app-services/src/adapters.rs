@@ -41,7 +41,7 @@ pub async fn handle_mcp_create_issue(
         Err(error) => {
             return Envelope::Err {
                 error: map_error_to_transport(validation_error(
-                    "invalid_mcp_payload",
+                    "invalid_payload",
                     format!("invalid MCP create_issue payload: {error}"),
                 )),
             };
@@ -65,7 +65,7 @@ pub async fn handle_mcp_get_issue(
         .and_then(Value::as_str)
         .ok_or_else(|| {
             validation_error(
-                "invalid_mcp_payload",
+                "invalid_payload",
                 "issue_id is required in MCP get_issue payload".to_owned(),
             )
         })

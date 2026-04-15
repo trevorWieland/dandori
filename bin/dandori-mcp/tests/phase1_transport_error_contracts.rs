@@ -5,7 +5,6 @@ use chrono::Utc;
 use dandori_api::{ApiState, build_router};
 use dandori_app_services::build_issue_service;
 use dandori_auth::JwtAuthenticator;
-use dandori_contract::{CreateIssueRequest, IssuePriorityDto};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -61,7 +60,7 @@ impl McpSession {
 }
 
 #[tokio::test]
-async fn rest_and_mcp_wire_paths_have_parity_for_success_and_failure() {
+async fn rest_and_mcp_wire_paths_have_parity_for_malformed_and_auth_errors() {
     let container = Postgres::default().start().await.expect("start postgres");
     let host = container.get_host().await.expect("host");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
@@ -158,7 +157,6 @@ async fn rest_and_mcp_wire_paths_have_parity_for_success_and_failure() {
     });
 
     let jwks_path = write_jwks_file();
-
     let mut mcp = spawn_mcp(&app_url, &jwks_path).await;
 
     let initialize = mcp
@@ -171,82 +169,71 @@ async fn rest_and_mcp_wire_paths_have_parity_for_success_and_failure() {
         .await;
     assert!(initialize.get("result").is_some());
 
-    let token = build_token(workspace_id);
-
     let rest_client = reqwest::Client::new();
-    let rest_create_request = CreateIssueRequest {
-        idempotency_key: "rest-wire-success".to_owned(),
-        project_id,
-        milestone_id: None,
-        title: "Wire parity".to_owned(),
-        description: Some("rest".to_owned()),
-        priority: IssuePriorityDto::Medium,
-    };
 
-    let rest_create = rest_client
+    let rest_invalid_payload = rest_client
         .post(format!("{rest_base}/v1/issues"))
-        .bearer_auth(&token)
-        .json(&rest_create_request)
+        .bearer_auth(build_token(workspace_id))
+        .header("content-type", "application/json")
+        .body("{")
         .send()
         .await
-        .expect("rest create request");
-    assert_eq!(rest_create.status(), 201);
-    let rest_create_envelope: Value = rest_create.json().await.expect("rest create json");
+        .expect("rest invalid payload request");
+    assert_eq!(rest_invalid_payload.status(), 422);
+    let rest_invalid_payload_envelope: Value = rest_invalid_payload
+        .json()
+        .await
+        .expect("rest invalid payload json");
 
-    let mcp_create = mcp
+    let mcp_invalid_payload = mcp
         .send(json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
             "params": {
                 "name": "issue.create",
-                "token": token,
+                "token": build_token(workspace_id),
                 "arguments": {
-                    "idempotency_key": "mcp-wire-success",
-                    "project_id": project_id,
-                    "milestone_id": null,
-                    "title": "Wire parity",
-                    "description": "mcp",
+                    "idempotency_key": "invalid-payload",
+                    "project_id": "not-a-uuid",
+                    "title": "bad payload",
                     "priority": "medium"
                 }
             }
         }))
         .await;
-
-    let mcp_create_envelope = mcp_create
+    let mcp_invalid_payload_envelope = mcp_invalid_payload
         .get("result")
         .and_then(|value| value.get("envelope"))
         .cloned()
-        .expect("mcp create envelope");
+        .expect("mcp invalid payload envelope");
 
-    assert_eq!(
-        rest_create_envelope
-            .get("status")
-            .and_then(Value::as_str)
-            .expect("rest status"),
-        "ok"
-    );
-    assert_eq!(
-        mcp_create_envelope
-            .get("status")
-            .and_then(Value::as_str)
-            .expect("mcp status"),
-        "ok"
-    );
+    let rest_invalid_payload_code = rest_invalid_payload_envelope
+        .get("error")
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        .expect("rest invalid payload code");
+    let mcp_invalid_payload_code = mcp_invalid_payload_envelope
+        .get("error")
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        .expect("mcp invalid payload code");
+    assert_eq!(rest_invalid_payload_code, "invalid_payload");
+    assert_eq!(mcp_invalid_payload_code, "invalid_payload");
 
-    let missing_issue = Uuid::now_v7();
-    let rest_get_missing = rest_client
-        .get(format!("{rest_base}/v1/issues/{missing_issue}"))
+    let rest_invalid_issue_id = rest_client
+        .get(format!("{rest_base}/v1/issues/not-a-uuid"))
         .bearer_auth(build_token(workspace_id))
         .send()
         .await
-        .expect("rest missing get request");
+        .expect("rest invalid issue id request");
+    assert_eq!(rest_invalid_issue_id.status(), 422);
+    let rest_invalid_issue_id_envelope: Value = rest_invalid_issue_id
+        .json()
+        .await
+        .expect("rest invalid issue id json");
 
-    assert_eq!(rest_get_missing.status(), 404);
-    let rest_get_missing_envelope: Value =
-        rest_get_missing.json().await.expect("rest missing json");
-
-    let mcp_get_missing = mcp
+    let mcp_invalid_issue_id = mcp
         .send(json!({
             "jsonrpc": "2.0",
             "id": 3,
@@ -254,45 +241,83 @@ async fn rest_and_mcp_wire_paths_have_parity_for_success_and_failure() {
             "params": {
                 "name": "issue.get",
                 "token": build_token(workspace_id),
-                "arguments": {"issue_id": missing_issue}
+                "arguments": {"issue_id": "not-a-uuid"}
             }
         }))
         .await;
-
-    let mcp_get_missing_envelope = mcp_get_missing
+    let mcp_invalid_issue_id_envelope = mcp_invalid_issue_id
         .get("result")
         .and_then(|value| value.get("envelope"))
         .cloned()
-        .expect("mcp missing envelope");
+        .expect("mcp invalid issue id envelope");
 
-    assert_eq!(
-        rest_get_missing_envelope
-            .get("status")
-            .and_then(Value::as_str)
-            .expect("rest missing status"),
-        "err"
-    );
-    assert_eq!(
-        mcp_get_missing_envelope
-            .get("status")
-            .and_then(Value::as_str)
-            .expect("mcp missing status"),
-        "err"
-    );
-
-    let rest_missing_code = rest_get_missing_envelope
+    let rest_invalid_issue_code = rest_invalid_issue_id_envelope
         .get("error")
         .and_then(|value| value.get("code"))
         .and_then(Value::as_str)
-        .expect("rest missing code");
-    let mcp_missing_code = mcp_get_missing_envelope
+        .expect("rest invalid issue code");
+    let mcp_invalid_issue_code = mcp_invalid_issue_id_envelope
         .get("error")
         .and_then(|value| value.get("code"))
         .and_then(Value::as_str)
-        .expect("mcp missing code");
+        .expect("mcp invalid issue code");
+    assert_eq!(rest_invalid_issue_code, "invalid_issue_id");
+    assert_eq!(mcp_invalid_issue_code, "invalid_issue_id");
 
-    assert_eq!(rest_missing_code, "issue_not_found");
-    assert_eq!(mcp_missing_code, "issue_not_found");
+    let rest_unauthorized = rest_client
+        .post(format!("{rest_base}/v1/issues"))
+        .json(&json!({
+            "idempotency_key": "unauthorized",
+            "project_id": project_id,
+            "milestone_id": null,
+            "title": "unauthorized",
+            "description": null,
+            "priority": "medium"
+        }))
+        .send()
+        .await
+        .expect("rest unauthorized request");
+    assert_eq!(rest_unauthorized.status(), 401);
+    let rest_unauthorized_envelope: Value = rest_unauthorized
+        .json()
+        .await
+        .expect("rest unauthorized json");
+
+    let mcp_unauthorized = mcp
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "issue.create",
+                "token": "bad.token.value",
+                "arguments": {
+                    "idempotency_key": "unauthorized",
+                    "project_id": project_id,
+                    "title": "unauthorized",
+                    "priority": "medium"
+                }
+            }
+        }))
+        .await;
+    let mcp_unauthorized_envelope = mcp_unauthorized
+        .get("result")
+        .and_then(|value| value.get("envelope"))
+        .cloned()
+        .expect("mcp unauthorized envelope");
+
+    let rest_unauthorized_code = rest_unauthorized_envelope
+        .get("error")
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        .expect("rest unauthorized code");
+    let mcp_unauthorized_code = mcp_unauthorized_envelope
+        .get("error")
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        .expect("mcp unauthorized code");
+    assert_eq!(rest_unauthorized_code, "unauthorized");
+    assert_eq!(mcp_unauthorized_code, "unauthorized");
 
     mcp.shutdown().await;
     rest_server.abort();

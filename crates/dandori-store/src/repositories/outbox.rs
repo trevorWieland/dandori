@@ -88,7 +88,7 @@ pub(crate) async fn mark_outbox_delivered(
     let mut tx = store.pool().begin().await?;
     set_workspace_context_tx(&mut tx, auth.workspace_id.0).await?;
 
-    sqlx::query(
+    let rows_affected = sqlx::query(
         "UPDATE outbox
          SET status = 'delivered'::outbox_status,
              published_at = $1,
@@ -96,12 +96,22 @@ pub(crate) async fn mark_outbox_delivered(
              leased_until = NULL,
              updated_at = $1,
              last_error = NULL
-         WHERE id = $2",
+         WHERE workspace_id = $2 AND id = $3",
     )
     .bind(now)
+    .bind(auth.workspace_id.0)
     .bind(outbox_id)
     .execute(tx.as_mut())
-    .await?;
+    .await?
+    .rows_affected();
+
+    if rows_affected != 1 {
+        return Err(StoreError::OutboxUpdateNotSingleRow {
+            workspace_id: auth.workspace_id.0,
+            outbox_id,
+            rows_affected,
+        });
+    }
 
     tx.commit().await?;
     Ok(())
@@ -119,10 +129,16 @@ pub(crate) async fn mark_outbox_failed(
     let mut tx = store.pool().begin().await?;
     set_workspace_context_tx(&mut tx, auth.workspace_id.0).await?;
 
-    let current_attempts = fetch_attempts_for_update(&mut tx, outbox_id).await?;
+    let current_attempts = fetch_attempts_for_update(&mut tx, auth.workspace_id.0, outbox_id)
+        .await?
+        .ok_or(StoreError::OutboxUpdateNotSingleRow {
+            workspace_id: auth.workspace_id.0,
+            outbox_id,
+            rows_affected: 0,
+        })?;
     let next_attempts = current_attempts + 1;
 
-    if next_attempts >= max_attempts {
+    let rows_affected = if next_attempts >= max_attempts {
         sqlx::query(
             "UPDATE outbox
              SET status = 'dead_letter'::outbox_status,
@@ -132,14 +148,16 @@ pub(crate) async fn mark_outbox_failed(
                  leased_until = NULL,
                  updated_at = $2,
                  last_error = $3
-             WHERE id = $4",
+             WHERE workspace_id = $4 AND id = $5",
         )
         .bind(next_attempts)
         .bind(now)
         .bind(error_message)
+        .bind(auth.workspace_id.0)
         .bind(outbox_id)
         .execute(tx.as_mut())
-        .await?;
+        .await?
+        .rows_affected()
     } else {
         sqlx::query(
             "UPDATE outbox
@@ -150,15 +168,25 @@ pub(crate) async fn mark_outbox_failed(
                  leased_until = NULL,
                  updated_at = $3,
                  last_error = $4
-             WHERE id = $5",
+             WHERE workspace_id = $5 AND id = $6",
         )
         .bind(next_attempts)
         .bind(now + retry_backoff)
         .bind(now)
         .bind(error_message)
+        .bind(auth.workspace_id.0)
         .bind(outbox_id)
         .execute(tx.as_mut())
-        .await?;
+        .await?
+        .rows_affected()
+    };
+
+    if rows_affected != 1 {
+        return Err(StoreError::OutboxUpdateNotSingleRow {
+            workspace_id: auth.workspace_id.0,
+            outbox_id,
+            rows_affected,
+        });
     }
 
     tx.commit().await?;
@@ -176,9 +204,13 @@ pub(crate) async fn cleanup_outbox(
 
     let deleted = sqlx::query(
         "DELETE FROM outbox
-         WHERE (status = 'delivered'::outbox_status AND published_at < $1)
-            OR (status = 'dead_letter'::outbox_status AND updated_at < $2)",
+         WHERE workspace_id = $1
+           AND (
+                (status = 'delivered'::outbox_status AND published_at < $2)
+             OR (status = 'dead_letter'::outbox_status AND updated_at < $3)
+           )",
     )
+    .bind(auth.workspace_id.0)
     .bind(delivered_before)
     .bind(dead_letter_before)
     .execute(tx.as_mut())
@@ -197,11 +229,15 @@ pub(crate) async fn cleanup_idempotency(
     let mut tx = store.pool().begin().await?;
     set_workspace_context_tx(&mut tx, auth.workspace_id.0).await?;
 
-    let deleted = sqlx::query("DELETE FROM idempotency_record WHERE expires_at < $1")
-        .bind(expires_before)
-        .execute(tx.as_mut())
-        .await?
-        .rows_affected();
+    let deleted = sqlx::query(
+        "DELETE FROM idempotency_record
+         WHERE workspace_id = $1 AND expires_at < $2",
+    )
+    .bind(auth.workspace_id.0)
+    .bind(expires_before)
+    .execute(tx.as_mut())
+    .await?
+    .rows_affected();
 
     tx.commit().await?;
     Ok(deleted)
@@ -209,16 +245,18 @@ pub(crate) async fn cleanup_idempotency(
 
 async fn fetch_attempts_for_update(
     tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
     outbox_id: Uuid,
-) -> Result<i32, StoreError> {
+) -> Result<Option<i32>, StoreError> {
     let attempts = sqlx::query_scalar::<_, i32>(
         "SELECT attempts
          FROM outbox
-         WHERE id = $1
+         WHERE workspace_id = $1 AND id = $2
          FOR UPDATE",
     )
+    .bind(workspace_id)
     .bind(outbox_id)
-    .fetch_one(tx.as_mut())
+    .fetch_optional(tx.as_mut())
     .await?;
 
     Ok(attempts)

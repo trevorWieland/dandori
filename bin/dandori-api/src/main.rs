@@ -7,8 +7,11 @@ async fn main() -> anyhow::Result<()> {
     let database_url = std::env::var("DANDORI_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
     let bind = std::env::var("DANDORI_API_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_owned());
+    let run_migrations = std::env::var("DANDORI_RUN_MIGRATIONS")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
 
-    let state = dandori_api::ApiState::new(&database_url, true).await?;
+    let state = dandori_api::ApiState::new(&database_url, run_migrations).await?;
     let router = dandori_api::build_router(state);
 
     let listener = tokio::net::TcpListener::bind(bind.as_str()).await?;

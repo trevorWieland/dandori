@@ -434,6 +434,7 @@ dependencies = [
  "dandori-auth",
  "dandori-contract",
  "secrecy",
+ "serde_json",
  "tokio",
  "tracing-subscriber",
  "uuid",
@@ -443,16 +444,19 @@ dependencies = [
 name = "dandori-app-services"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "dandori-contract",
  "dandori-domain",
  "dandori-store",
+ "reqwest",
  "serde_json",
  "sqlx",
  "testcontainers",
  "testcontainers-modules",
  "thiserror",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -478,6 +482,15 @@ dependencies = [
  "serde",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "dandori-deps-check"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -521,6 +534,16 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "dandori-migrate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dandori-store",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

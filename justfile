@@ -29,6 +29,9 @@ bootstrap:
       lefthook install
     fi
 
+db-migrate:
+    @{{ cargo }} run -p dandori-migrate --quiet
+
 build:
     @{{ cargo }} build --workspace
 
@@ -96,38 +99,50 @@ check-suppression:
     fi
 
 check-deps:
+    @{{ cargo }} run -p dandori-deps-check --quiet
+
+check-sql-policy:
     #!/usr/bin/env bash
     set -euo pipefail
-    metadata=$({{ cargo }} metadata --format-version 1 --no-deps)
-    failed=0
+    offenders=$(
+      rg -n 'sqlx::' crates/dandori-store/src \
+        --glob '!crates/dandori-store/src/repositories/common.rs' \
+        --glob '!crates/dandori-store/src/repositories/issue.rs' \
+        --glob '!crates/dandori-store/src/repositories/outbox.rs' \
+        --glob '!crates/dandori-store/src/pg_store.rs' || true
+    )
+    if [[ -n "$offenders" ]]; then
+      echo "FAIL: sqlx usage is only allowed in sanctioned escape-hatch modules"
+      echo "$offenders"
+      exit 1
+    fi
 
-    foundation=("dandori-domain" "dandori-contract" "dandori-policy" "dandori-observability")
-    capability=("dandori-store" "dandori-graph" "dandori-workflow" "dandori-sync-github" "dandori-orchestrator" "dandori-app-services")
+check-sqlx-offline:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ ! -d .sqlx ]]; then
+      echo "FAIL: .sqlx metadata directory is missing"
+      exit 1
+    fi
+    if [[ -z "$(ls -A .sqlx 2>/dev/null)" ]]; then
+      echo "FAIL: .sqlx metadata directory is empty"
+      exit 1
+    fi
 
-    for f in "${foundation[@]}"; do
-      deps=$(echo "$metadata" | jq -r ".packages[] | select(.name == \"$f\") | .dependencies[].name" 2>/dev/null || true)
-      for c in "${capability[@]}"; do
-        if echo "$deps" | grep -qx "$c"; then
-          echo "FAIL: foundation crate '$f' depends on capability crate '$c'"
-          failed=1
-        fi
-      done
-    done
+check-no-leaks:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp=$(mktemp)
+    trap 'rm -f "$tmp"' EXIT
+    {{ cargo }} nextest run --workspace --profile ci --no-tests=pass --status-level leak --final-status-level all 2>&1 | tee "$tmp"
+    if rg -n '(?i)\bleak\b' "$tmp" >/dev/null 2>&1; then
+      echo "FAIL: leaky tests detected in nextest output"
+      exit 1
+    fi
 
-    transport=("dandori-api" "dandori-mcp" "dandori-worker")
-    forbidden=("dandori-domain" "dandori-store" "dandori-orchestrator")
-
-    for b in "${transport[@]}"; do
-      deps=$(echo "$metadata" | jq -r ".packages[] | select(.name == \"$b\") | .dependencies[].name" 2>/dev/null || true)
-      for f in "${forbidden[@]}"; do
-        if echo "$deps" | grep -qx "$f"; then
-          echo "FAIL: transport binary '$b' depends directly on '$f'"
-          failed=1
-        fi
-      done
-    done
-
-    if [[ "$failed" -eq 1 ]]; then exit 1; fi
+perf-gate:
+    @{{ cargo }} test -p dandori-store --test phase1_perf_gate -- --nocapture
+    @{{ cargo }} test -p dandori-app-services --test phase1_perf_gate -- --nocapture
 
 check-thin-interface:
     #!/usr/bin/env bash
@@ -158,5 +173,5 @@ check-ci-parity:
       exit 1
     fi
 
-ci: fmt lint check test phase1-gate coverage deny machete doc check-lines check-suppression check-deps check-thin-interface check-store-boundary check-ci-parity
+ci: fmt lint check test phase1-gate perf-gate check-no-leaks coverage deny machete doc check-lines check-suppression check-deps check-sql-policy check-sqlx-offline check-thin-interface check-store-boundary check-ci-parity
     @echo "==> All CI checks passed"

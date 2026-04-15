@@ -7,8 +7,11 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url = std::env::var("DANDORI_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let run_migrations = std::env::var("DANDORI_RUN_MIGRATIONS")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
 
-    let state = dandori_mcp::McpState::new(&database_url, true).await?;
+    let state = dandori_mcp::McpState::new(&database_url, run_migrations).await?;
 
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();

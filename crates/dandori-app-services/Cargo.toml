@@ -10,12 +10,15 @@ publish = false
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 chrono = { workspace = true }
 dandori-contract = { path = "../dandori-contract", version = "0.1.0" }
 dandori-domain = { path = "../dandori-domain", version = "0.1.0" }
 dandori-store = { path = "../dandori-store", version = "0.1.0" }
+reqwest = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

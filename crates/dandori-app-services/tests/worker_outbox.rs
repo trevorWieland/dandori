@@ -1,5 +1,10 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use dandori_app_services::{OutboxWorkerConfig, OutboxWorkerService};
+use dandori_app_services::{
+    OutboxPublisher, OutboxWorkerConfig, OutboxWorkerService, PublishError, PublishErrorKind,
+};
 use dandori_domain::{
     AuthContext, CommandId, CreateIssueCommandV1, IdempotencyKey, IssueCreatedEventV1, IssueId,
     IssuePriority,
@@ -16,6 +21,54 @@ struct TestWorkerDb {
     store: PgStore,
     auth: AuthContext,
     project_id: Uuid,
+}
+
+#[derive(Debug)]
+struct AlwaysOkPublisher;
+
+#[async_trait]
+impl OutboxPublisher for AlwaysOkPublisher {
+    async fn publish_issue_created(
+        &self,
+        _message: &dandori_store::OutboxMessage,
+        _event: &IssueCreatedEventV1,
+    ) -> Result<(), PublishError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct TransientFailurePublisher;
+
+#[async_trait]
+impl OutboxPublisher for TransientFailurePublisher {
+    async fn publish_issue_created(
+        &self,
+        _message: &dandori_store::OutboxMessage,
+        _event: &IssueCreatedEventV1,
+    ) -> Result<(), PublishError> {
+        Err(PublishError {
+            kind: PublishErrorKind::Transient,
+            message: "temporary downstream outage".to_owned(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct PermanentFailurePublisher;
+
+#[async_trait]
+impl OutboxPublisher for PermanentFailurePublisher {
+    async fn publish_issue_created(
+        &self,
+        _message: &dandori_store::OutboxMessage,
+        _event: &IssueCreatedEventV1,
+    ) -> Result<(), PublishError> {
+        Err(PublishError {
+            kind: PublishErrorKind::Permanent,
+            message: "permanent downstream rejection".to_owned(),
+        })
+    }
 }
 
 async fn setup() -> TestWorkerDb {
@@ -113,6 +166,7 @@ fn make_command(
     CreateIssueCommandV1 {
         command_id: CommandId(Uuid::now_v7()),
         idempotency_key: IdempotencyKey(idempotency_key.to_owned()),
+        request_fingerprint: format!("worker-fingerprint:{project_id}:{idempotency_key}"),
         issue_id: IssueId(Uuid::now_v7()),
         workspace_id: auth.workspace_id,
         project_id: project_id.into(),
@@ -163,6 +217,7 @@ async fn worker_delivers_known_issue_created_outbox_message() {
             dead_letter_retention_hours: 1_000,
             idempotency_retention_hours: 1_000,
         },
+        Arc::new(AlwaysOkPublisher),
     );
 
     let report = worker.run_once().await.expect("worker run");
@@ -210,6 +265,7 @@ async fn worker_retries_and_dead_letters_unknown_event_type() {
             dead_letter_retention_hours: 1_000,
             idempotency_retention_hours: 1_000,
         },
+        Arc::new(AlwaysOkPublisher),
     );
 
     let report = worker.run_once().await.expect("worker run");
@@ -234,4 +290,84 @@ async fn worker_retries_and_dead_letters_unknown_event_type() {
         .await
         .expect("cleanup outbox");
     assert_eq!(cleaned, 1);
+}
+
+#[tokio::test]
+async fn worker_marks_transient_publish_failures_as_failed_for_retry() {
+    let db = setup().await;
+    let command = make_command(&db.auth, db.project_id, "worker-transient-failure");
+    let event = make_event(&command);
+
+    db.store
+        .create_issue_transactional(&db.auth, &command, &event)
+        .await
+        .expect("issue create");
+
+    let worker = OutboxWorkerService::new(
+        db.store.clone(),
+        OutboxWorkerConfig {
+            workspace_id: db.auth.workspace_id.0,
+            actor_id: db.auth.actor_id,
+            batch_size: 10,
+            lease_seconds: 30,
+            max_attempts: 3,
+            retry_backoff_seconds: 0,
+            delivered_retention_hours: 1_000,
+            dead_letter_retention_hours: 1_000,
+            idempotency_retention_hours: 1_000,
+        },
+        Arc::new(TransientFailurePublisher),
+    );
+
+    let report = worker.run_once().await.expect("worker run");
+    assert_eq!(report.leased, 1);
+    assert_eq!(report.delivered, 0);
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.dead_lettered, 0);
+
+    let status: String = sqlx::query_scalar("SELECT status::text FROM outbox LIMIT 1")
+        .fetch_one(&db.admin_pool)
+        .await
+        .expect("read outbox status");
+    assert_eq!(status, "failed");
+}
+
+#[tokio::test]
+async fn worker_marks_permanent_publish_failures_dead_letter_when_attempt_budget_is_one() {
+    let db = setup().await;
+    let command = make_command(&db.auth, db.project_id, "worker-permanent-failure");
+    let event = make_event(&command);
+
+    db.store
+        .create_issue_transactional(&db.auth, &command, &event)
+        .await
+        .expect("issue create");
+
+    let worker = OutboxWorkerService::new(
+        db.store.clone(),
+        OutboxWorkerConfig {
+            workspace_id: db.auth.workspace_id.0,
+            actor_id: db.auth.actor_id,
+            batch_size: 10,
+            lease_seconds: 30,
+            max_attempts: 1,
+            retry_backoff_seconds: 0,
+            delivered_retention_hours: 1_000,
+            dead_letter_retention_hours: 1_000,
+            idempotency_retention_hours: 1_000,
+        },
+        Arc::new(PermanentFailurePublisher),
+    );
+
+    let report = worker.run_once().await.expect("worker run");
+    assert_eq!(report.leased, 1);
+    assert_eq!(report.delivered, 0);
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.dead_lettered, 1);
+
+    let status: String = sqlx::query_scalar("SELECT status::text FROM outbox LIMIT 1")
+        .fetch_one(&db.admin_pool)
+        .await
+        .expect("read outbox status");
+    assert_eq!(status, "dead_letter");
 }

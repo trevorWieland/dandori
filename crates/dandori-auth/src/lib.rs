@@ -21,6 +21,7 @@ pub struct OidcConfig {
     pub issuer: String,
     pub audience: String,
     pub jwks_source: JwksSource,
+    pub allowed_algorithms: Vec<Algorithm>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +34,7 @@ pub enum JwksSource {
 pub struct JwtAuthenticator {
     issuer: String,
     audience: String,
+    allowed_algorithms: Vec<Algorithm>,
     keys: HashMap<String, JwkEntry>,
     fallback_key: Option<JwkEntry>,
 }
@@ -70,6 +72,8 @@ pub enum AuthError {
     UnknownKid(String),
     #[error("token algorithm is not allowed for selected key")]
     AlgorithmMismatch,
+    #[error("token algorithm '{0}' is not in allowed algorithms")]
+    DisallowedAlgorithm(String),
     #[error("token verification failed: {0}")]
     TokenVerify(jsonwebtoken::errors::Error),
     #[error("invalid 'sub' claim as UUID: {0}")]
@@ -117,13 +121,32 @@ impl JwtAuthenticator {
                 })?,
         };
 
-        Self::from_jwks_json(config.issuer, config.audience, &jwks_raw)
+        Self::from_jwks_json_with_allowed_algorithms(
+            config.issuer,
+            config.audience,
+            &jwks_raw,
+            config.allowed_algorithms,
+        )
     }
 
     pub fn from_jwks_json(
         issuer: String,
         audience: String,
         jwks_raw: &str,
+    ) -> Result<Self, AuthError> {
+        Self::from_jwks_json_with_allowed_algorithms(
+            issuer,
+            audience,
+            jwks_raw,
+            default_test_allowed_algorithms(),
+        )
+    }
+
+    pub fn from_jwks_json_with_allowed_algorithms(
+        issuer: String,
+        audience: String,
+        jwks_raw: &str,
+        allowed_algorithms: Vec<Algorithm>,
     ) -> Result<Self, AuthError> {
         let jwk_set: JwkSet = serde_json::from_str(jwks_raw).map_err(AuthError::InvalidJwks)?;
         if jwk_set.keys.is_empty() {
@@ -149,6 +172,7 @@ impl JwtAuthenticator {
         Ok(Self {
             issuer,
             audience,
+            allowed_algorithms,
             keys,
             fallback_key,
         })
@@ -180,6 +204,10 @@ impl JwtAuthenticator {
             }
         }
 
+        if !self.allowed_algorithms.contains(&header.alg) {
+            return Err(AuthError::DisallowedAlgorithm(format!("{:?}", header.alg)));
+        }
+
         let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[self.issuer.as_str()]);
         validation.set_audience(&[self.audience.as_str()]);
@@ -208,6 +236,7 @@ impl std::fmt::Debug for JwtAuthenticator {
         f.debug_struct("JwtAuthenticator")
             .field("issuer", &self.issuer)
             .field("audience", &self.audience)
+            .field("allowed_algorithms", &self.allowed_algorithms)
             .field("keys_count", &self.keys.len())
             .finish_non_exhaustive()
     }
@@ -229,10 +258,17 @@ impl OidcConfig {
             _ => return Err(AuthError::InvalidJwksSource),
         };
 
+        let allowed_algorithms = std::env::var("DANDORI_OIDC_ALLOWED_ALGS")
+            .ok()
+            .map(|value| parse_allowed_algorithms(value.as_str()))
+            .transpose()?
+            .unwrap_or_else(default_runtime_allowed_algorithms);
+
         Ok(Self {
             issuer,
             audience,
             jwks_source,
+            allowed_algorithms,
         })
     }
 }
@@ -272,6 +308,69 @@ fn map_key_algorithm(algorithm: &KeyAlgorithm) -> Result<Algorithm, AuthError> {
     };
 
     Ok(mapped)
+}
+
+fn parse_allowed_algorithms(value: &str) -> Result<Vec<Algorithm>, AuthError> {
+    let mut parsed = Vec::new();
+    for raw in value.split(',') {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+
+        let algorithm = match item {
+            "RS256" => Algorithm::RS256,
+            "RS384" => Algorithm::RS384,
+            "RS512" => Algorithm::RS512,
+            "PS256" => Algorithm::PS256,
+            "PS384" => Algorithm::PS384,
+            "PS512" => Algorithm::PS512,
+            "ES256" => Algorithm::ES256,
+            "ES384" => Algorithm::ES384,
+            "EdDSA" => Algorithm::EdDSA,
+            "HS256" => Algorithm::HS256,
+            "HS384" => Algorithm::HS384,
+            "HS512" => Algorithm::HS512,
+            _ => return Err(AuthError::AlgorithmMismatch),
+        };
+        parsed.push(algorithm);
+    }
+
+    if parsed.is_empty() {
+        return Err(AuthError::AlgorithmMismatch);
+    }
+    Ok(parsed)
+}
+
+fn default_runtime_allowed_algorithms() -> Vec<Algorithm> {
+    vec![
+        Algorithm::RS256,
+        Algorithm::RS384,
+        Algorithm::RS512,
+        Algorithm::PS256,
+        Algorithm::PS384,
+        Algorithm::PS512,
+        Algorithm::ES256,
+        Algorithm::ES384,
+        Algorithm::EdDSA,
+    ]
+}
+
+fn default_test_allowed_algorithms() -> Vec<Algorithm> {
+    vec![
+        Algorithm::HS256,
+        Algorithm::HS384,
+        Algorithm::HS512,
+        Algorithm::RS256,
+        Algorithm::RS384,
+        Algorithm::RS512,
+        Algorithm::PS256,
+        Algorithm::PS384,
+        Algorithm::PS512,
+        Algorithm::ES256,
+        Algorithm::ES384,
+        Algorithm::EdDSA,
+    ]
 }
 
 #[cfg(test)]

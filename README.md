@@ -28,6 +28,12 @@ Run the phase-specific gate directly:
 just phase1-gate
 ```
 
+Run explicit database migrations:
+
+```bash
+just db-migrate
+```
+
 ## OIDC/JWKS Configuration (Required)
 
 API and MCP now run in strict fail-closed mode and require OIDC/JWKS configuration.
@@ -39,8 +45,16 @@ Required environment variables:
 - exactly one of:
   - `DANDORI_OIDC_JWKS_PATH`
   - `DANDORI_OIDC_JWKS_URL`
+- optional strict algorithm allowlist:
+  - `DANDORI_OIDC_ALLOWED_ALGS` (comma-separated, e.g. `RS256,ES256,EdDSA`)
 
 No fallback dev secrets are enabled.
+
+## Runtime Migration Posture
+
+- API, MCP, and worker binaries default to `run_migrations = false`.
+- To explicitly allow startup migrations for controlled local workflows, set:
+  - `DANDORI_RUN_MIGRATIONS=true`
 
 ## MCP Runtime
 
@@ -58,9 +72,17 @@ Example request flow:
 
 Phase 1 integration tests require Docker (for ephemeral PostgreSQL testcontainers).
 
+## Worker Publisher Runtime
+
+The worker supports a concrete HTTP publisher adapter.
+
+- `DANDORI_OUTBOX_PUBLISH_URL` (optional)
+  - when set: worker publishes `issue.created.v1` envelopes to this URL
+  - when unset: worker uses a no-op publisher for local/dev flows
+
 ## Workspace Layout
 
-- `bin/` thin binaries (`dandori-api`, `dandori-mcp`, `dandori-worker`)
+- `bin/` binaries (`dandori-api`, `dandori-mcp`, `dandori-worker`, `dandori-migrate`)
 - `crates/` library crates for domain, contracts, policy, store, orchestration, and app services
 - `docs/adr/` architecture decision records
 - `frontend/` frontend scaffold placeholder

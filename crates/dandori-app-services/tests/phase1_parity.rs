@@ -233,3 +233,91 @@ async fn rest_and_mcp_get_issue_have_equivalent_not_found_failures()
     assert_eq!(mcp_error_code, "issue_not_found");
     Ok(())
 }
+
+#[tokio::test]
+async fn rest_and_mcp_create_issue_retry_replays_and_payload_drift_conflicts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let test = setup().await;
+
+    let request = CreateIssueRequest {
+        idempotency_key: "retry-replay".to_owned(),
+        project_id: test.project_id,
+        milestone_id: None,
+        title: "Replay me".to_owned(),
+        description: Some("same payload".to_owned()),
+        priority: IssuePriorityDto::Medium,
+    };
+
+    let (first_status, first) =
+        handle_rest_create_issue(&test.service, &test.auth, request.clone()).await;
+    assert_eq!(first_status, 201);
+    let first_issue_id = match first {
+        Envelope::Ok { data } => {
+            assert!(!data.idempotent_replay);
+            data.issue.id
+        }
+        Envelope::Err { error } => {
+            return Err(format!("unexpected first rest error: {error:?}").into());
+        }
+    };
+
+    let (retry_status, retry) =
+        handle_rest_create_issue(&test.service, &test.auth, request.clone()).await;
+    assert_eq!(retry_status, 201);
+    match retry {
+        Envelope::Ok { data } => {
+            assert!(data.idempotent_replay);
+            assert_eq!(data.issue.id, first_issue_id);
+        }
+        Envelope::Err { error } => {
+            return Err(format!("unexpected rest retry error: {error:?}").into());
+        }
+    }
+
+    let mcp_retry =
+        handle_mcp_create_issue(&test.service, &test.auth, json!(request.clone())).await;
+    match mcp_retry {
+        Envelope::Ok { data } => {
+            let replay = data
+                .get("idempotent_replay")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let issue_id = data
+                .get("issue")
+                .and_then(|issue| issue.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            assert!(replay);
+            assert_eq!(issue_id, first_issue_id.to_string());
+        }
+        Envelope::Err { error } => {
+            return Err(format!("unexpected mcp retry error: {error:?}").into());
+        }
+    }
+
+    let mut changed = request;
+    changed.title = "Replay changed".to_owned();
+
+    let (rest_conflict_status, rest_conflict) =
+        handle_rest_create_issue(&test.service, &test.auth, changed.clone()).await;
+    assert_eq!(rest_conflict_status, 409);
+    let rest_conflict_code = match rest_conflict {
+        Envelope::Ok { data } => {
+            return Err(format!("unexpected rest conflict success: {data:?}").into());
+        }
+        Envelope::Err { error } => error.code,
+    };
+    assert_eq!(rest_conflict_code, "duplicate_issue_command");
+
+    let mcp_conflict = handle_mcp_create_issue(&test.service, &test.auth, json!(changed)).await;
+    let mcp_conflict_code = match mcp_conflict {
+        Envelope::Ok { data } => {
+            return Err(format!("unexpected mcp conflict success: {data:?}").into());
+        }
+        Envelope::Err { error } => error.code,
+    };
+    assert_eq!(mcp_conflict_code, "duplicate_issue_command");
+
+    Ok(())
+}

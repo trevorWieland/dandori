@@ -12,7 +12,8 @@ pub use service::{
     validation_error,
 };
 pub use worker::{
-    OutboxWorkerConfig, OutboxWorkerService, WorkerRunReport, build_outbox_worker_service,
+    HttpOutboxPublisher, OutboxPublisher, OutboxWorkerConfig, OutboxWorkerService, PublishError,
+    PublishErrorKind, WorkerRunReport, build_outbox_worker_service,
 };
 
 #[must_use]

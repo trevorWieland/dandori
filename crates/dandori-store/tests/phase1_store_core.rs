@@ -29,7 +29,7 @@ async fn workspace_and_project_repository_read_write_respect_tenant_context() {
                 project_id: created_project_id,
                 workspace_id: db.workspace_a,
                 name: "project-created".to_owned(),
-                workflow_version_id: db.workflow_a,
+                workflow_version_id: db._workflow_a,
             },
         )
         .await
@@ -46,7 +46,7 @@ async fn workspace_and_project_repository_read_write_respect_tenant_context() {
 
     assert_eq!(fetched_project.name, "project-created");
 
-    let auth_b = auth_context(db.workspace_b, Uuid::now_v7());
+    let auth_b = auth_context(db._workspace_b, Uuid::now_v7());
     let cross_tenant = db
         .app_store
         .get_project(&auth_b, created_project_id)
@@ -88,6 +88,28 @@ async fn create_workspace_works_when_auth_workspace_matches_inserted_id() {
 }
 
 #[tokio::test]
+async fn create_project_requires_workflow_version_in_same_workspace() {
+    let db = setup_db().await;
+    let auth = auth_context(db.workspace_a, Uuid::now_v7());
+
+    let error = db
+        .app_store
+        .create_project(
+            &auth,
+            ProjectWriteInput {
+                project_id: Uuid::now_v7(),
+                workspace_id: db.workspace_a,
+                name: "bad-project".to_owned(),
+                workflow_version_id: Uuid::now_v7(),
+            },
+        )
+        .await
+        .expect_err("missing workflow version should fail");
+
+    assert!(matches!(error, StoreError::WorkflowVersionNotFound));
+}
+
+#[tokio::test]
 async fn rls_allows_same_tenant_and_denies_cross_tenant_reads() {
     let db = setup_db().await;
 
@@ -101,7 +123,7 @@ async fn rls_allows_same_tenant_and_denies_cross_tenant_reads() {
     let event = make_event(&command);
 
     let auth_a = auth_context(db.workspace_a, command.actor_id);
-    let auth_b = auth_context(db.workspace_b, Uuid::now_v7());
+    let auth_b = auth_context(db._workspace_b, Uuid::now_v7());
 
     db.app_store
         .create_issue_transactional(&auth_a, &command, &event)
@@ -153,7 +175,7 @@ async fn rls_denies_when_tenant_context_missing() {
 }
 
 #[tokio::test]
-async fn create_issue_is_idempotent_and_conflicts_on_changed_command_id() {
+async fn create_issue_is_idempotent_and_conflicts_on_changed_request_fingerprint() {
     let db = setup_db().await;
 
     let issue_id = Uuid::now_v7();
@@ -186,20 +208,38 @@ async fn create_issue_is_idempotent_and_conflicts_on_changed_command_id() {
     assert!(replay.idempotent_replay);
     assert_eq!(replay.issue.id.0, issue_id);
 
-    let conflicting = make_command(
+    let retry_like_command = make_command(
         db.workspace_a,
         db.project_a,
         Uuid::now_v7(),
         Uuid::now_v7(),
         "idem-write",
     );
+    let retry_like_event = make_event(&retry_like_command);
+    let retry_replay = db
+        .app_store
+        .create_issue_transactional(&auth, &retry_like_command, &retry_like_event)
+        .await
+        .expect("retry with same key+fingerprint should replay");
+
+    assert!(retry_replay.idempotent_replay);
+    assert_eq!(retry_replay.issue.id.0, issue_id);
+
+    let mut conflicting = make_command(
+        db.workspace_a,
+        db.project_a,
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        "idem-write",
+    );
+    conflicting.request_fingerprint = "changed-fingerprint".to_owned();
     let conflicting_event = make_event(&conflicting);
 
     let error = db
         .app_store
         .create_issue_transactional(&auth, &conflicting, &conflicting_event)
         .await
-        .expect_err("different command id with same key must conflict");
+        .expect_err("different request fingerprint with same key must conflict");
 
     assert!(matches!(error, StoreError::IdempotencyConflict));
 }
@@ -209,14 +249,14 @@ async fn failed_create_does_not_write_activity_or_outbox() {
     let db = setup_db().await;
 
     let bad_command = make_command(
-        db.workspace_b,
+        db._workspace_b,
         db.project_a,
         Uuid::now_v7(),
         Uuid::now_v7(),
         "idem-fail",
     );
     let event = make_event(&bad_command);
-    let auth = auth_context(db.workspace_b, bad_command.actor_id);
+    let auth = auth_context(db._workspace_b, bad_command.actor_id);
 
     let error = db
         .app_store
@@ -242,6 +282,74 @@ async fn failed_create_does_not_write_activity_or_outbox() {
 
     assert_eq!(activity_count, 0);
     assert_eq!(outbox_count, 0);
+}
+
+#[tokio::test]
+async fn create_issue_enforces_milestone_workspace_and_project_consistency() {
+    let db = setup_db().await;
+    let auth = auth_context(db.workspace_a, Uuid::now_v7());
+
+    let missing_milestone = make_command(
+        db.workspace_a,
+        db.project_a,
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        "idem-missing-milestone",
+    );
+    let mut missing_milestone = missing_milestone;
+    missing_milestone.milestone_id = Some(Uuid::now_v7().into());
+    let missing_event = make_event(&missing_milestone);
+    let missing_error = db
+        .app_store
+        .create_issue_transactional(&auth, &missing_milestone, &missing_event)
+        .await
+        .expect_err("missing milestone must fail");
+    assert!(matches!(missing_error, StoreError::MilestoneNotFound));
+
+    let milestone_id = Uuid::now_v7();
+    query(
+        "INSERT INTO milestone (id, workspace_id, project_id, title)
+         VALUES ($1, $2, $3, 'ms-a')",
+    )
+    .bind(milestone_id)
+    .bind(db.workspace_a)
+    .bind(db.project_a)
+    .execute(&db.admin_pool)
+    .await
+    .expect("seed milestone");
+
+    let other_project_id = Uuid::now_v7();
+    query(
+        "INSERT INTO project (id, workspace_id, name, workflow_version_id)
+         VALUES ($1, $2, 'project-a-2', $3)",
+    )
+    .bind(other_project_id)
+    .bind(db.workspace_a)
+    .bind(db._workflow_a)
+    .execute(&db.admin_pool)
+    .await
+    .expect("seed second project in same workspace");
+
+    let mismatch_command = make_command(
+        db.workspace_a,
+        other_project_id,
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        "idem-mismatch-milestone",
+    );
+    let mut mismatch_command = mismatch_command;
+    mismatch_command.milestone_id = Some(milestone_id.into());
+    let mismatch_event = make_event(&mismatch_command);
+
+    let mismatch_error = db
+        .app_store
+        .create_issue_transactional(&auth, &mismatch_command, &mismatch_event)
+        .await
+        .expect_err("mismatched milestone/project must fail");
+    assert!(matches!(
+        mismatch_error,
+        StoreError::MilestoneProjectMismatch
+    ));
 }
 
 #[tokio::test]
@@ -323,4 +431,46 @@ async fn fault_injection_after_issue_insert_rolls_back_issue_activity_outbox_and
     assert_eq!(activity_count, 0);
     assert_eq!(outbox_count, 0);
     assert_eq!(idempotency_count, 0);
+}
+
+#[tokio::test]
+async fn composite_foreign_keys_block_cross_tenant_relations() {
+    let db = setup_db().await;
+
+    let cross_tenant_project_insert = query(
+        "INSERT INTO project (id, workspace_id, name, workflow_version_id)
+         VALUES ($1, $2, 'cross-tenant-project', $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(db.workspace_a)
+    .bind(Uuid::now_v7())
+    .execute(&db.admin_pool)
+    .await
+    .expect_err("cross-tenant workflow linkage must fail");
+
+    let project_fk_code = cross_tenant_project_insert
+        .as_database_error()
+        .and_then(|db_err| db_err.code())
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    assert_eq!(project_fk_code, "23503");
+
+    let cross_tenant_issue_insert = query(
+        "INSERT INTO issue (
+            id, workspace_id, project_id, milestone_id, title, description, state_category, priority
+         ) VALUES ($1, $2, $3, NULL, 'bad', NULL, 'open'::issue_state_category, 'low'::issue_priority)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(db.workspace_a)
+    .bind(db._project_b)
+    .execute(&db.admin_pool)
+    .await
+    .expect_err("cross-tenant issue->project linkage must fail");
+
+    let issue_fk_code = cross_tenant_issue_insert
+        .as_database_error()
+        .and_then(|db_err| db_err.code())
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    assert_eq!(issue_fk_code, "23503");
 }
