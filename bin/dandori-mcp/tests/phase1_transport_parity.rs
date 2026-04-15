@@ -10,7 +10,6 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tempfile::TempDir;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -158,8 +157,7 @@ async fn rest_and_mcp_wire_paths_have_parity_for_success_and_failure() {
         axum::serve(listener, router).await.expect("serve api");
     });
 
-    let jwks_dir = TempDir::new().expect("tmp dir");
-    let jwks_path = write_jwks_file(jwks_dir.path());
+    let jwks_path = write_jwks_file();
 
     let mut mcp = spawn_mcp(&app_url, &jwks_path).await;
 
@@ -322,8 +320,8 @@ async fn spawn_mcp(database_url: &str, jwks_path: &PathBuf) -> McpSession {
     }
 }
 
-fn write_jwks_file(root: &std::path::Path) -> PathBuf {
-    let path = root.join("jwks.json");
+fn write_jwks_file() -> PathBuf {
+    let path = std::env::temp_dir().join(format!("dandori-jwks-{}.json", Uuid::now_v7()));
     std::fs::write(&path, TEST_JWKS).expect("write jwks fixture");
     path
 }

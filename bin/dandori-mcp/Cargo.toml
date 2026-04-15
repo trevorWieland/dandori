@@ -29,5 +29,4 @@ reqwest = { workspace = true }
 sqlx = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
-tempfile = "3"
 uuid = { workspace = true }

@@ -62,7 +62,7 @@ fix:
     @{{ cargo }} clippy --workspace --all-targets --fix --allow-dirty --allow-staged -- -D warnings
 
 deny:
-    @{{ cargo }} deny check
+    @{{ cargo }} deny check --hide-inclusion-graph
 
 machete:
     @{{ cargo }} machete
