@@ -1,0 +1,13 @@
+[package]
+name = "dandori-app-services"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dandori-domain = { path = "../dandori-domain" }
+thiserror = { workspace = true }

@@ -1,0 +1,103 @@
+[workspace]
+members = [
+  "bin/dandori-api",
+  "bin/dandori-mcp",
+  "bin/dandori-worker",
+  "crates/dandori-domain",
+  "crates/dandori-contract",
+  "crates/dandori-policy",
+  "crates/dandori-store",
+  "crates/dandori-graph",
+  "crates/dandori-workflow",
+  "crates/dandori-sync-github",
+  "crates/dandori-orchestrator",
+  "crates/dandori-observability",
+  "crates/dandori-app-services",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/trevorWieland/dandori"
+
+[workspace.lints.rust]
+warnings = "deny"
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+unimplemented = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+] }
+sea-orm = { version = "1.1", default-features = false, features = [
+  "macros",
+  "runtime-tokio-rustls",
+  "sqlx-postgres",
+  "sqlx-sqlite",
+  "with-chrono",
+  "with-uuid",
+  "with-json",
+] }
+sea-orm-migration = { version = "1.1", default-features = false, features = [
+  "runtime-tokio-rustls",
+  "sqlx-postgres",
+  "sqlx-sqlite",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+secrecy = "0.10"
+sqlx = { version = "0.8", default-features = false, features = [
+  "postgres",
+  "sqlite",
+  "runtime-tokio-rustls",
+  "uuid",
+  "chrono",
+  "json",
+] }
+thiserror = "2"
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+  "signal",
+  "net",
+] }
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# dev tooling
+insta = { version = "1", features = ["yaml"] }
+proptest = "1"
+wiremock = "0.6"
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }

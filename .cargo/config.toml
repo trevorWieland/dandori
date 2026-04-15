@@ -1,0 +1,6 @@
+[alias]
+t = "nextest run"
+c = "clippy --workspace --all-targets"
+
+[net]
+retry = 3

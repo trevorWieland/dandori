@@ -1,0 +1,4 @@
+# Baseline ownership (non-blocking until branch rules require code owners)
+* @trevorWieland
+/docs/adr/ @trevorWieland
+/.github/ @trevorWieland

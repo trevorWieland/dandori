@@ -1,0 +1,13 @@
+[package]
+name = "dandori-mcp"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+dandori-app-services = { path = "../../crates/dandori-app-services" }

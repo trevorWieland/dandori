@@ -1,0 +1,17 @@
+[
+  {"name":"type:bug","color":"d73a4a","description":"Bug or defect"},
+  {"name":"type:feature","color":"0e8a16","description":"Feature request or implementation"},
+  {"name":"type:architecture","color":"5319e7","description":"Architecture and design"},
+  {"name":"priority:p0","color":"b60205","description":"Critical"},
+  {"name":"priority:p1","color":"d93f0b","description":"High"},
+  {"name":"priority:p2","color":"fbca04","description":"Medium"},
+  {"name":"priority:p3","color":"c2e0c6","description":"Low"},
+  {"name":"status:blocked","color":"000000","description":"Blocked by dependency or decision"},
+  {"name":"status:ready","color":"1d76db","description":"Ready for execution"},
+  {"name":"area:backend","color":"0052cc","description":"Backend scope"},
+  {"name":"area:frontend","color":"0366d6","description":"Frontend scope"},
+  {"name":"area:infra","color":"6f42c1","description":"Infrastructure and CI"},
+  {"name":"needs-adr","color":"5319e7","description":"Requires architecture decision record"},
+  {"name":"blocked","color":"000000","description":"Blocked"},
+  {"name":"security","color":"e11d21","description":"Security-sensitive work"}
+]
