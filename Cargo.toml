@@ -56,7 +56,7 @@ anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
   "json",
@@ -102,7 +102,7 @@ tokio = { version = "1", features = [
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-uuid = { version = "=1.15.1", features = ["v7", "serde"] }
+uuid = { version = "=1.23.0", features = ["v7", "serde"] }
 
 # dev tooling
 insta = { version = "1", features = ["yaml"] }
