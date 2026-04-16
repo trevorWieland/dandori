@@ -1,17 +1,16 @@
 use std::cmp::Ordering;
+use std::sync::Arc;
 use std::time::Instant;
 
 use dandori_app_services::{IssueAppService, OutboxWorkerConfig, OutboxWorkerService};
 use dandori_contract::{CreateIssueRequest, IssuePriorityDto};
 use dandori_domain::AuthContext;
-use dandori_store::{PgStore, migrate_database};
-use sqlx::PgPool;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::postgres::Postgres;
+use dandori_store::PgStore;
+use dandori_test_support::{AlwaysOkPublisher, TestDatabase, setup_database};
 use uuid::Uuid;
 
 struct TestService {
-    _container: testcontainers::ContainerAsync<Postgres>,
+    _db: TestDatabase,
     auth: AuthContext,
     workspace_id: Uuid,
     project_id: Uuid,
@@ -20,87 +19,18 @@ struct TestService {
 }
 
 async fn setup() -> TestService {
-    let container = Postgres::default().start().await.expect("start postgres");
-    let host = container.get_host().await.expect("host");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-
-    let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    migrate_database(&admin_url).await.expect("migrate");
-
-    let admin_pool = PgPool::connect(&admin_url).await.expect("connect admin");
-
-    sqlx::query(
-        "DO $$
-            BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dandori_app') THEN
-                    CREATE ROLE dandori_app
-                        LOGIN
-                        PASSWORD 'dandori_app'
-                        NOSUPERUSER
-                        NOCREATEDB
-                        NOCREATEROLE
-                        NOBYPASSRLS;
-                END IF;
-            END
-        $$;",
-    )
-    .execute(&admin_pool)
-    .await
-    .expect("create app role");
-
-    sqlx::query("GRANT USAGE ON SCHEMA public TO dandori_app")
-        .execute(&admin_pool)
-        .await
-        .expect("grant schema usage");
-
-    sqlx::query(
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO dandori_app",
-    )
-    .execute(&admin_pool)
-    .await
-    .expect("grant table perms");
-
-    let workspace_id = Uuid::now_v7();
-    let workflow_id = Uuid::now_v7();
-    let project_id = Uuid::now_v7();
-
-    sqlx::query("INSERT INTO workspace (id, name) VALUES ($1, 'ws-a')")
-        .bind(workspace_id)
-        .execute(&admin_pool)
-        .await
-        .expect("seed workspace");
-
-    sqlx::query(
-        "INSERT INTO workflow_version (id, workspace_id, name, version, checksum, states, transitions)
-         VALUES ($1, $2, 'default', 1, 'sha256:a', '[]'::jsonb, '[]'::jsonb)",
-    )
-    .bind(workflow_id)
-    .bind(workspace_id)
-    .execute(&admin_pool)
-    .await
-    .expect("seed workflow");
-
-    sqlx::query(
-        "INSERT INTO project (id, workspace_id, name, workflow_version_id)
-         VALUES ($1, $2, 'project-a', $3)",
-    )
-    .bind(project_id)
-    .bind(workspace_id)
-    .bind(workflow_id)
-    .execute(&admin_pool)
-    .await
-    .expect("seed project");
-
-    let app_url = format!("postgres://dandori_app:dandori_app@{host}:{port}/postgres");
-    let store = PgStore::connect(&app_url).await.expect("connect app store");
+    let db = setup_database().await;
+    let workspace_id = db.workspace_a;
+    let project_id = db.project_a;
+    let store = db.app_store.clone();
     let service = IssueAppService::new(store.clone());
-
+    let auth = AuthContext {
+        workspace_id: workspace_id.into(),
+        actor_id: Uuid::now_v7(),
+    };
     TestService {
-        _container: container,
-        auth: AuthContext {
-            workspace_id: workspace_id.into(),
-            actor_id: Uuid::now_v7(),
-        },
+        _db: db,
+        auth,
         workspace_id,
         project_id,
         store,
@@ -193,22 +123,20 @@ async fn worker_run_once_meets_slo_p50_p95_and_throughput() {
     let started = Instant::now();
 
     for _ in 0..6 {
-        let worker = OutboxWorkerService::with_default_publisher(
-            test.store.clone(),
-            OutboxWorkerConfig {
-                workspace_ids: vec![test.workspace_id],
-                shard_index: 0,
-                shard_total: 1,
-                worker_instance_id: test.auth.actor_id,
-                batch_size: 16,
-                lease_seconds: 30,
-                max_attempts: 3,
-                retry_backoff_seconds: 0,
-                delivered_retention_hours: 1_000,
-                dead_letter_retention_hours: 1_000,
-                idempotency_retention_hours: 1_000,
-            },
-        );
+        let config = OutboxWorkerConfig {
+            workspace_ids: Some(vec![test.workspace_id]),
+            worker_instance_id: test.auth.actor_id,
+            batch_size: 16,
+            lease_seconds: 30,
+            max_attempts: 3,
+            retry_backoff_seconds: 0,
+            delivered_retention_hours: 1_000,
+            dead_letter_retention_hours: 1_000,
+            idempotency_retention_hours: 1_000,
+            ..OutboxWorkerConfig::default()
+        };
+        let worker =
+            OutboxWorkerService::new(test.store.clone(), config, Arc::new(AlwaysOkPublisher));
 
         let op_started = Instant::now();
         let report = worker.run_once().await.expect("worker run");

@@ -25,6 +25,7 @@ tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
 dandori-api = { path = "../dandori-api", version = "0.1.0" }
+dandori-test-support = { path = "../../crates/dandori-test-support", version = "0.1.0" }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
 sqlx = { workspace = true }

@@ -1,211 +1,67 @@
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use dandori_domain::{
-    AuthContext, CreateIssueCommandV1, Issue, IssueCreatedEventV1, IssuePriority,
-    IssueStateCategory,
+    AuthContext, CommandName, CreateIssueCommandV1, EventType, Issue, IssueCreatedEventV1,
+    IssuePriority, IssueStateCategory,
 };
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction,
-    EntityTrait, QueryFilter, QueryResult, Set, Statement, TransactionTrait,
-};
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::entities::{activity, idempotency_record, milestone, project};
 use crate::pg_store::{CreateIssueWriteResult, IdempotencyResponse, PgStore};
-use crate::{StoreError, repositories::common::set_workspace_context_db};
+use crate::{StoreError, repositories::common::set_workspace_context_tx};
 
-const ISSUE_CREATE_COMMAND_NAME: &str = "issue.create.v1";
-
+/// Full issue-create write path. Idempotency is reserved atomically through
+/// `INSERT … ON CONFLICT … RETURNING`; the `(xmax = 0)` sentinel tells us
+/// whether this transaction won the race (fresh write) or lost it (replay
+/// / conflict), making the behaviour deterministic under concurrency.
 pub(crate) async fn create_issue_transactional(
     store: &PgStore,
     auth: &AuthContext,
     command: &CreateIssueCommandV1,
     event: &IssueCreatedEventV1,
 ) -> Result<CreateIssueWriteResult, StoreError> {
-    let tx = store.db().begin().await?;
-    set_workspace_context_db(&tx, auth.workspace_id.0).await?;
-
-    let maybe_idempotency = idempotency_record::Entity::find_by_id((
-        command.workspace_id.0,
-        ISSUE_CREATE_COMMAND_NAME.to_owned(),
-        command.idempotency_key.as_str().to_owned(),
-    ))
-    .one(&tx)
-    .await?;
-
-    if let Some(existing) = maybe_idempotency {
-        if !matches_request_fingerprint(existing.request_fingerprint.as_str(), command) {
-            return Err(StoreError::IdempotencyConflict);
-        }
-        let replay: IdempotencyResponse = serde_json::from_value(existing.response_payload)?;
-        tx.commit().await?;
-        return Ok(CreateIssueWriteResult {
-            issue: replay.issue,
-            idempotent_replay: true,
-        });
-    }
-
-    let project_exists = project::Entity::find()
-        .filter(project::Column::Id.eq(command.project_id.0))
-        .filter(project::Column::WorkspaceId.eq(command.workspace_id.0))
-        .one(&tx)
-        .await?
-        .is_some();
-    if !project_exists {
-        return Err(StoreError::ProjectNotFound);
-    }
-
-    if let Some(milestone_id) = command.milestone_id {
-        let milestone_model = milestone::Entity::find()
-            .filter(milestone::Column::Id.eq(milestone_id.0))
-            .filter(milestone::Column::WorkspaceId.eq(command.workspace_id.0))
-            .one(&tx)
-            .await?;
-
-        let milestone_model = milestone_model.ok_or(StoreError::MilestoneNotFound)?;
-        if milestone_model.project_id != command.project_id.0 {
-            return Err(StoreError::MilestoneProjectMismatch);
-        }
+    if let Some(existing) = read_existing_idempotency(store, auth, command).await? {
+        return resolve_existing_idempotency(existing, command);
     }
 
     let occurred_at = event.occurred_at.fixed_offset();
-
-    tx.execute(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        "INSERT INTO issue (
-            id,
-            workspace_id,
-            project_id,
-            milestone_id,
-            title,
-            description,
-            state_category,
-            priority,
-            archived_at,
-            row_version,
-            created_at,
-            updated_at
-        ) VALUES (
-            $1,
-            $2,
-            $3,
-            $4,
-            $5,
-            $6,
-            'open'::issue_state_category,
-            $7::issue_priority,
-            NULL,
-            0,
-            $8,
-            $8
-        )",
-        vec![
-            command.issue_id.0.into(),
-            command.workspace_id.0.into(),
-            command.project_id.0.into(),
-            command.milestone_id.map(|value| value.0).into(),
-            command.title.clone().into(),
-            command.description.clone().into(),
-            priority_as_str(command.priority).to_owned().into(),
-            occurred_at.into(),
-        ],
-    ))
-    .await?;
-
-    activity::ActiveModel {
-        id: Set(Uuid::now_v7()),
-        workspace_id: Set(command.workspace_id.0),
-        project_id: Set(command.project_id.0),
-        issue_id: Set(Some(command.issue_id.0)),
-        command_id: Set(command.command_id.0),
-        actor_id: Set(command.actor_id),
-        event_type: Set("issue.created.v1".to_owned()),
-        event_payload: Set(serde_json::json!(event)),
-        created_at: Set(occurred_at),
-    }
-    .insert(&tx)
-    .await?;
-
-    tx.execute(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        "INSERT INTO outbox (
-            id,
-            workspace_id,
-            event_id,
-            event_type,
-            aggregate_type,
-            aggregate_id,
-            occurred_at,
-            correlation_id,
-            payload,
-            attempts,
-            available_at,
-            status,
-            leased_at,
-            leased_until,
-            lease_token,
-            lease_owner,
-            published_at,
-            last_error,
-            created_at,
-            updated_at
-        ) VALUES (
-            $1,
-            $2,
-            $3,
-            $4,
-            $5,
-            $6,
-            $7,
-            $8,
-            $9,
-            0,
-            $10,
-            'pending'::outbox_status,
-            NULL,
-            NULL,
-            NULL,
-            NULL,
-            NULL,
-            NULL,
-            $10,
-            $10
-        )",
-        vec![
-            Uuid::now_v7().into(),
-            command.workspace_id.0.into(),
-            event.event_id.into(),
-            "issue.created.v1".to_owned().into(),
-            "issue".to_owned().into(),
-            command.issue_id.0.into(),
-            occurred_at.into(),
-            command.command_id.0.into(),
-            serde_json::json!(event).into(),
-            occurred_at.into(),
-        ],
-    ))
-    .await?;
-
-    let issue = fetch_issue_in_tx(&tx, command.issue_id.0)
-        .await?
-        .ok_or(StoreError::IdempotencyReplayMissingIssue)?;
-
     let idempotency_now = Utc::now().fixed_offset();
-    idempotency_record::ActiveModel {
-        workspace_id: Set(command.workspace_id.0),
-        command_name: Set(ISSUE_CREATE_COMMAND_NAME.to_owned()),
-        idempotency_key: Set(command.idempotency_key.as_str().to_owned()),
-        request_fingerprint: Set(command.request_fingerprint.clone()),
-        response_payload: Set(serde_json::json!(IdempotencyResponse {
-            issue: issue.clone(),
-        })),
-        expires_at: Set((Utc::now() + Duration::days(7)).fixed_offset()),
-        created_at: Set(idempotency_now),
-    }
-    .insert(&tx)
+    let idempotency_expires = (Utc::now() + Duration::days(7)).fixed_offset();
+
+    let mut tx = store.pool().begin().await?;
+    set_workspace_context_tx(&mut tx, auth.workspace_id.0).await?;
+
+    ensure_project_exists(&mut tx, command).await?;
+    ensure_milestone_belongs_to_project(&mut tx, command).await?;
+
+    insert_issue(&mut tx, command, occurred_at).await?;
+    insert_activity(&mut tx, command, event, occurred_at).await?;
+    insert_outbox(&mut tx, command, event, occurred_at).await?;
+
+    let response_payload = serde_json::to_value(IdempotencyResponse {
+        issue: fetch_issue_in_tx(&mut tx, command.issue_id.0)
+            .await?
+            .ok_or(StoreError::IdempotencyReplayMissingIssue)?,
+    })?;
+
+    let reservation = reserve_idempotency(
+        &mut tx,
+        command,
+        &response_payload,
+        idempotency_now,
+        idempotency_expires,
+    )
     .await?;
 
-    tx.commit().await?;
+    if !reservation.inserted {
+        // We lost the race. Roll back this transaction's issue/outbox/activity
+        // writes and map to a deterministic replay or conflict based on the
+        // fingerprint already stored by the winning transaction.
+        tx.rollback().await?;
+        return branch_on_stored_fingerprint(command, reservation);
+    }
 
+    let issue: Issue = serde_json::from_value::<IdempotencyResponse>(response_payload)?.issue;
+    tx.commit().await?;
     Ok(CreateIssueWriteResult {
         issue,
         idempotent_replay: false,
@@ -217,63 +73,373 @@ pub(crate) async fn get_issue(
     auth: &AuthContext,
     issue_id: Uuid,
 ) -> Result<Option<Issue>, StoreError> {
-    let tx = store.db().begin().await?;
-    set_workspace_context_db(&tx, auth.workspace_id.0).await?;
-    let issue = fetch_issue_in_tx(&tx, issue_id).await?;
+    let mut tx = store.pool().begin().await?;
+    set_workspace_context_tx(&mut tx, auth.workspace_id.0).await?;
+    let issue = fetch_issue_in_tx(&mut tx, issue_id).await?;
     tx.commit().await?;
     Ok(issue)
 }
 
+struct ExistingIdempotencyRecord {
+    request_fingerprint: String,
+    response_payload: serde_json::Value,
+}
+
+async fn read_existing_idempotency(
+    store: &PgStore,
+    auth: &AuthContext,
+    command: &CreateIssueCommandV1,
+) -> Result<Option<ExistingIdempotencyRecord>, StoreError> {
+    let mut tx = store.pool().begin().await?;
+    set_workspace_context_tx(&mut tx, auth.workspace_id.0).await?;
+    let row = sqlx::query!(
+        r#"SELECT request_fingerprint, response_payload as "response_payload!: serde_json::Value"
+           FROM idempotency_record
+           WHERE workspace_id = $1
+             AND command_name = $2
+             AND idempotency_key = $3"#,
+        command.workspace_id.0,
+        CommandName::IssueCreateV1.as_str(),
+        command.idempotency_key.as_str(),
+    )
+    .fetch_optional(tx.as_mut())
+    .await?;
+    tx.commit().await?;
+    Ok(row.map(|row| ExistingIdempotencyRecord {
+        request_fingerprint: row.request_fingerprint,
+        response_payload: row.response_payload,
+    }))
+}
+
+fn resolve_existing_idempotency(
+    existing: ExistingIdempotencyRecord,
+    command: &CreateIssueCommandV1,
+) -> Result<CreateIssueWriteResult, StoreError> {
+    if !matches_request_fingerprint(existing.request_fingerprint.as_str(), command) {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    let replay: IdempotencyResponse = serde_json::from_value(existing.response_payload)?;
+    Ok(CreateIssueWriteResult {
+        issue: replay.issue,
+        idempotent_replay: true,
+    })
+}
+
+async fn ensure_project_exists(
+    tx: &mut Transaction<'_, Postgres>,
+    command: &CreateIssueCommandV1,
+) -> Result<(), StoreError> {
+    let exists = sqlx::query_scalar!(
+        r#"SELECT EXISTS (
+               SELECT 1 FROM project WHERE id = $1 AND workspace_id = $2
+           ) as "exists!""#,
+        command.project_id.0,
+        command.workspace_id.0,
+    )
+    .fetch_one(tx.as_mut())
+    .await?;
+    if !exists {
+        return Err(StoreError::ProjectNotFound);
+    }
+    Ok(())
+}
+
+async fn ensure_milestone_belongs_to_project(
+    tx: &mut Transaction<'_, Postgres>,
+    command: &CreateIssueCommandV1,
+) -> Result<(), StoreError> {
+    let Some(milestone_id) = command.milestone_id else {
+        return Ok(());
+    };
+
+    let row = sqlx::query!(
+        r#"SELECT project_id as "project_id!: Uuid"
+           FROM milestone
+           WHERE id = $1 AND workspace_id = $2"#,
+        milestone_id.0,
+        command.workspace_id.0,
+    )
+    .fetch_optional(tx.as_mut())
+    .await?;
+
+    let row = row.ok_or(StoreError::MilestoneNotFound)?;
+    if row.project_id != command.project_id.0 {
+        return Err(StoreError::MilestoneProjectMismatch);
+    }
+    Ok(())
+}
+
+async fn insert_issue(
+    tx: &mut Transaction<'_, Postgres>,
+    command: &CreateIssueCommandV1,
+    occurred_at: DateTime<FixedOffset>,
+) -> Result<(), StoreError> {
+    let priority_text = priority_as_str(command.priority).to_owned();
+    let milestone_id = command.milestone_id.map(|value| value.0);
+    sqlx::query!(
+        r#"INSERT INTO issue (
+               id,
+               workspace_id,
+               project_id,
+               milestone_id,
+               title,
+               description,
+               state_category,
+               priority,
+               archived_at,
+               row_version,
+               created_at,
+               updated_at
+           ) VALUES (
+               $1,
+               $2,
+               $3,
+               $4,
+               $5,
+               $6,
+               'open'::issue_state_category,
+               $7::text::issue_priority,
+               NULL,
+               0,
+               $8,
+               $8
+           )"#,
+        command.issue_id.0,
+        command.workspace_id.0,
+        command.project_id.0,
+        milestone_id,
+        command.title,
+        command.description,
+        priority_text,
+        occurred_at,
+    )
+    .execute(tx.as_mut())
+    .await?;
+    Ok(())
+}
+
+async fn insert_activity(
+    tx: &mut Transaction<'_, Postgres>,
+    command: &CreateIssueCommandV1,
+    event: &IssueCreatedEventV1,
+    occurred_at: DateTime<FixedOffset>,
+) -> Result<(), StoreError> {
+    let activity_id = Uuid::now_v7();
+    let event_payload = serde_json::to_value(event)?;
+    let issue_id = Some(command.issue_id.0);
+    sqlx::query!(
+        r#"INSERT INTO activity (
+               id,
+               workspace_id,
+               project_id,
+               issue_id,
+               command_id,
+               actor_id,
+               event_type,
+               event_payload,
+               created_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+        activity_id,
+        command.workspace_id.0,
+        command.project_id.0,
+        issue_id,
+        command.command_id.0,
+        command.actor_id,
+        EventType::IssueCreatedV1.as_str(),
+        event_payload,
+        occurred_at,
+    )
+    .execute(tx.as_mut())
+    .await?;
+    Ok(())
+}
+
+async fn insert_outbox(
+    tx: &mut Transaction<'_, Postgres>,
+    command: &CreateIssueCommandV1,
+    event: &IssueCreatedEventV1,
+    occurred_at: DateTime<FixedOffset>,
+) -> Result<(), StoreError> {
+    let outbox_id = Uuid::now_v7();
+    let payload = serde_json::to_value(event)?;
+    sqlx::query!(
+        r#"INSERT INTO outbox (
+               id,
+               workspace_id,
+               event_id,
+               event_type,
+               aggregate_type,
+               aggregate_id,
+               occurred_at,
+               correlation_id,
+               payload,
+               attempts,
+               available_at,
+               status,
+               leased_at,
+               leased_until,
+               lease_token,
+               lease_owner,
+               published_at,
+               last_error,
+               created_at,
+               updated_at
+           ) VALUES (
+               $1,
+               $2,
+               $3,
+               $4,
+               $5,
+               $6,
+               $7,
+               $8,
+               $9,
+               0,
+               $10,
+               'pending'::outbox_status,
+               NULL,
+               NULL,
+               NULL,
+               NULL,
+               NULL,
+               NULL,
+               $10,
+               $10
+           )"#,
+        outbox_id,
+        command.workspace_id.0,
+        event.event_id,
+        EventType::IssueCreatedV1.as_str(),
+        "issue",
+        command.issue_id.0,
+        occurred_at,
+        command.command_id.0,
+        payload,
+        occurred_at,
+    )
+    .execute(tx.as_mut())
+    .await?;
+    Ok(())
+}
+
+struct IdempotencyReservation {
+    inserted: bool,
+    stored_fingerprint: String,
+    stored_payload: serde_json::Value,
+}
+
+async fn reserve_idempotency(
+    tx: &mut Transaction<'_, Postgres>,
+    command: &CreateIssueCommandV1,
+    response_payload: &serde_json::Value,
+    now: DateTime<FixedOffset>,
+    expires_at: DateTime<FixedOffset>,
+) -> Result<IdempotencyReservation, StoreError> {
+    let row = sqlx::query!(
+        r#"INSERT INTO idempotency_record (
+               workspace_id,
+               command_name,
+               idempotency_key,
+               request_fingerprint,
+               response_payload,
+               expires_at,
+               created_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (workspace_id, command_name, idempotency_key)
+           DO UPDATE SET expires_at = idempotency_record.expires_at
+           RETURNING
+               (xmax = 0) as "inserted!",
+               request_fingerprint as "stored_fingerprint!",
+               response_payload as "stored_payload!: serde_json::Value""#,
+        command.workspace_id.0,
+        CommandName::IssueCreateV1.as_str(),
+        command.idempotency_key.as_str(),
+        command.request_fingerprint,
+        response_payload,
+        expires_at,
+        now,
+    )
+    .fetch_one(tx.as_mut())
+    .await?;
+
+    Ok(IdempotencyReservation {
+        inserted: row.inserted,
+        stored_fingerprint: row.stored_fingerprint,
+        stored_payload: row.stored_payload,
+    })
+}
+
+fn branch_on_stored_fingerprint(
+    command: &CreateIssueCommandV1,
+    reservation: IdempotencyReservation,
+) -> Result<CreateIssueWriteResult, StoreError> {
+    if !matches_request_fingerprint(reservation.stored_fingerprint.as_str(), command) {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    let replay: IdempotencyResponse = serde_json::from_value(reservation.stored_payload)?;
+    Ok(CreateIssueWriteResult {
+        issue: replay.issue,
+        idempotent_replay: true,
+    })
+}
+
+struct IssueRow {
+    id: Uuid,
+    workspace_id: Uuid,
+    project_id: Uuid,
+    milestone_id: Option<Uuid>,
+    title: String,
+    description: Option<String>,
+    state_category: String,
+    priority: String,
+    archived_at: Option<DateTime<FixedOffset>>,
+    row_version: i64,
+    created_at: DateTime<FixedOffset>,
+    updated_at: DateTime<FixedOffset>,
+}
+
 async fn fetch_issue_in_tx(
-    tx: &DatabaseTransaction,
+    tx: &mut Transaction<'_, Postgres>,
     issue_id: Uuid,
 ) -> Result<Option<Issue>, StoreError> {
-    let row = tx
-        .query_one(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            r#"SELECT
-                   id,
-                   workspace_id,
-                   project_id,
-                   milestone_id,
-                   title,
-                   description,
-                   state_category::text AS state_category,
-                   priority::text AS priority,
-                   archived_at,
-                   row_version,
-                   created_at,
-                   updated_at
-               FROM issue
-               WHERE id = $1"#,
-            vec![issue_id.into()],
-        ))
-        .await?;
+    let row = sqlx::query_as!(
+        IssueRow,
+        r#"SELECT
+               id as "id!: Uuid",
+               workspace_id as "workspace_id!: Uuid",
+               project_id as "project_id!: Uuid",
+               milestone_id as "milestone_id: Uuid",
+               title,
+               description,
+               state_category::text as "state_category!",
+               priority::text as "priority!",
+               archived_at as "archived_at: DateTime<FixedOffset>",
+               row_version,
+               created_at as "created_at!: DateTime<FixedOffset>",
+               updated_at as "updated_at!: DateTime<FixedOffset>"
+           FROM issue
+           WHERE id = $1"#,
+        issue_id,
+    )
+    .fetch_optional(tx.as_mut())
+    .await?;
     row.map(map_issue_row).transpose()
 }
 
-fn map_issue_row(row: QueryResult) -> Result<Issue, StoreError> {
+fn map_issue_row(row: IssueRow) -> Result<Issue, StoreError> {
     Ok(Issue {
-        id: row.try_get::<Uuid>("", "id")?.into(),
-        workspace_id: row.try_get::<Uuid>("", "workspace_id")?.into(),
-        project_id: row.try_get::<Uuid>("", "project_id")?.into(),
-        milestone_id: row
-            .try_get::<Option<Uuid>>("", "milestone_id")?
-            .map(Into::into),
-        title: row.try_get("", "title")?,
-        description: row.try_get("", "description")?,
-        state_category: parse_state_category(row.try_get("", "state_category")?)?,
-        priority: parse_priority(row.try_get("", "priority")?)?,
-        archived_at: row
-            .try_get::<Option<chrono::DateTime<chrono::FixedOffset>>>("", "archived_at")?
-            .map(|value| value.with_timezone(&Utc)),
-        row_version: row.try_get("", "row_version")?,
-        created_at: row
-            .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "created_at")?
-            .with_timezone(&Utc),
-        updated_at: row
-            .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "updated_at")?
-            .with_timezone(&Utc),
+        id: row.id.into(),
+        workspace_id: row.workspace_id.into(),
+        project_id: row.project_id.into(),
+        milestone_id: row.milestone_id.map(Into::into),
+        title: row.title,
+        description: row.description,
+        state_category: parse_state_category(row.state_category)?,
+        priority: parse_priority(row.priority)?,
+        archived_at: row.archived_at.map(|value| value.with_timezone(&Utc)),
+        row_version: row.row_version,
+        created_at: row.created_at.with_timezone(&Utc),
+        updated_at: row.updated_at.with_timezone(&Utc),
     })
 }
 

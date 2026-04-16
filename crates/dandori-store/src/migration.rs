@@ -278,6 +278,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateActivityOutboxAndIdempotency),
             Box::new(CreateIndexes),
             Box::new(EnableRlsAndPolicies),
+            Box::new(CreateWorkerPartitionLease),
         ]
     }
 }
@@ -289,6 +290,8 @@ struct CreateActivityOutboxAndIdempotency;
 struct CreateIndexes;
 
 struct EnableRlsAndPolicies;
+
+struct CreateWorkerPartitionLease;
 
 impl MigrationName for CreateEnumsAndCoreTables {
     fn name(&self) -> &str {
@@ -311,6 +314,12 @@ impl MigrationName for CreateIndexes {
 impl MigrationName for EnableRlsAndPolicies {
     fn name(&self) -> &str {
         "m20260415_000004_enable_rls_and_policies"
+    }
+}
+
+impl MigrationName for CreateWorkerPartitionLease {
+    fn name(&self) -> &str {
+        "m20260416_000005_create_worker_partition_lease"
     }
 }
 
@@ -385,6 +394,62 @@ impl MigrationTrait for EnableRlsAndPolicies {
         manager
             .get_connection()
             .execute_unprepared(DROP_RLS_AND_POLICIES_SQL)
+            .await?;
+        Ok(())
+    }
+}
+
+const CREATE_WORKER_PARTITION_LEASE_SQL: &str = r#"
+CREATE TABLE worker_partition_lease (
+    workspace_id uuid PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE,
+    lease_owner uuid NOT NULL,
+    leased_at timestamptz NOT NULL,
+    leased_until timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_worker_partition_lease_owner_until
+    ON worker_partition_lease (lease_owner, leased_until);
+CREATE INDEX idx_worker_partition_lease_until
+    ON worker_partition_lease (leased_until);
+
+-- Worker orchestration is cross-tenant by design. The partition-lease
+-- acquisition path needs to see every workspace without bypassing tenant
+-- RLS elsewhere, so we expose a minimal, read-only SECURITY DEFINER
+-- function that returns the workspace id set. Roles (e.g. `dandori_app`)
+-- receive EXECUTE at role-setup time, NOT during the migration, so that
+-- the migration remains independent of which application role exists
+-- when it runs.
+CREATE OR REPLACE FUNCTION list_workspace_ids_for_partition_lease()
+RETURNS TABLE(id uuid)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+    SELECT id FROM workspace
+$$;
+"#;
+
+const DROP_WORKER_PARTITION_LEASE_SQL: &str = r#"
+DROP FUNCTION IF EXISTS list_workspace_ids_for_partition_lease();
+DROP INDEX IF EXISTS idx_worker_partition_lease_until;
+DROP INDEX IF EXISTS idx_worker_partition_lease_owner_until;
+DROP TABLE IF EXISTS worker_partition_lease;
+"#;
+
+#[sea_orm_migration::async_trait::async_trait]
+impl MigrationTrait for CreateWorkerPartitionLease {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(CREATE_WORKER_PARTITION_LEASE_SQL)
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(DROP_WORKER_PARTITION_LEASE_SQL)
             .await?;
         Ok(())
     }

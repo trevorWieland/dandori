@@ -104,10 +104,16 @@ check-deps:
 check-sql-policy:
     #!/usr/bin/env bash
     set -euo pipefail
+    # `sqlx::` is allowed only in repository modules that enforce compile-time
+    # SQL verification via `sqlx::query!` / `query_as!`. Stringly-typed or
+    # SeaORM-only modules are NOT on the allow-list; adding a new entry here
+    # should be a deliberate policy decision, not a work-around.
     offenders=$(
       rg -n 'sqlx::' crates/dandori-store/src \
         --glob '!crates/dandori-store/src/repositories/common.rs' \
+        --glob '!crates/dandori-store/src/repositories/issue.rs' \
         --glob '!crates/dandori-store/src/repositories/outbox.rs' \
+        --glob '!crates/dandori-store/src/repositories/partition.rs' \
         --glob '!crates/dandori-store/src/pg_store.rs' || true
     )
     if [[ -n "$offenders" ]]; then
@@ -159,9 +165,18 @@ check-thin-interface:
 check-store-boundary:
     #!/usr/bin/env bash
     set -euo pipefail
-    if rg -n 'sqlx::' crates/*/src --glob '!crates/dandori-store/**' >/dev/null 2>&1; then
+    # sqlx is allowed in dandori-store (production boundary) and in
+    # dandori-test-support (test-only crate whose sole consumers are
+    # `[dev-dependencies]` in integration test directories — never linked
+    # into production binaries).
+    if rg -n 'sqlx::' crates/*/src \
+         --glob '!crates/dandori-store/**' \
+         --glob '!crates/dandori-test-support/**' \
+         >/dev/null 2>&1; then
       echo "FAIL: sqlx usage outside dandori-store source boundary"
-      rg -n 'sqlx::' crates/*/src --glob '!crates/dandori-store/**'
+      rg -n 'sqlx::' crates/*/src \
+        --glob '!crates/dandori-store/**' \
+        --glob '!crates/dandori-test-support/**'
       exit 1
     fi
 

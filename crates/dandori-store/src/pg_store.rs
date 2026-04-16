@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::repositories::{issue, outbox, project, workspace};
+use crate::repositories::{issue, outbox, partition, project, workspace};
 
 #[derive(Debug, Clone)]
 pub struct PgStore {
@@ -53,8 +53,23 @@ pub struct OutboxMessage {
     pub leased_until: DateTime<Utc>,
 }
 
+/// Classification of an outbox publish failure. Only [`Transient`](Self::Transient)
+/// spends the per-row retry budget; [`Terminal`](Self::Terminal) causes the row
+/// to land in `dead_letter` on first failure so unretriable errors do not soak
+/// the worker's time or the DLQ scanner's attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxFailureClassification {
+    /// Retriable error (e.g. network blip, server 5xx, breaker open). Honours
+    /// the attempt budget and backoff.
+    Transient,
+    /// Non-retriable error (e.g. client 4xx, unsupported event type,
+    /// serialization failure). Dead-letters immediately.
+    Terminal,
+}
+
 #[derive(Debug, Clone)]
 pub struct OutboxFailureContext {
+    pub classification: OutboxFailureClassification,
     pub lease_token: Uuid,
     pub lease_owner: Uuid,
     pub now: DateTime<Utc>,
@@ -257,5 +272,40 @@ impl PgStore {
         expires_before: DateTime<Utc>,
     ) -> Result<u64, StoreError> {
         outbox::cleanup_idempotency(self, auth, expires_before).await
+    }
+
+    /// Atomically lease workspaces for this worker. Partitions held by
+    /// another worker with a still-valid lease are skipped; expired leases
+    /// are taken over. Callers must treat the returned list as definitive
+    /// ownership for the lease window.
+    pub async fn acquire_partitions(
+        &self,
+        owner_id: Uuid,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<Uuid>, StoreError> {
+        partition::acquire_partitions(&self.pool, owner_id, now, lease_until, limit).await
+    }
+
+    /// Extend the lease window on partitions currently owned by `owner_id`.
+    pub async fn renew_partitions(
+        &self,
+        owner_id: Uuid,
+        workspace_ids: &[Uuid],
+        now: DateTime<Utc>,
+        new_lease_until: DateTime<Utc>,
+    ) -> Result<Vec<Uuid>, StoreError> {
+        partition::renew_partitions(&self.pool, owner_id, workspace_ids, now, new_lease_until).await
+    }
+
+    /// Release partition leases held by this worker. Intended for graceful
+    /// shutdown; safe to call repeatedly.
+    pub async fn release_partitions(
+        &self,
+        owner_id: Uuid,
+        workspace_ids: &[Uuid],
+    ) -> Result<u64, StoreError> {
+        partition::release_partitions(&self.pool, owner_id, workspace_ids).await
     }
 }

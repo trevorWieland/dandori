@@ -1,5 +1,5 @@
 [package]
-name = "dandori-store"
+name = "dandori-test-support"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,19 +10,12 @@ publish = false
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 chrono = { workspace = true }
+dandori-app-services = { path = "../dandori-app-services", version = "0.1.0" }
 dandori-domain = { path = "../dandori-domain", version = "0.1.0" }
-sea-orm = { workspace = true }
-sea-orm-migration = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+dandori-store = { path = "../dandori-store", version = "0.1.0" }
 sqlx = { workspace = true }
-thiserror = { workspace = true }
-uuid = { workspace = true }
-
-[dev-dependencies]
-dandori-test-support = { path = "../dandori-test-support", version = "0.1.0" }
-futures = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
-tokio = { workspace = true }
+uuid = { workspace = true }

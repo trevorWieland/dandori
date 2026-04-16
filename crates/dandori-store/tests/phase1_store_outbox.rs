@@ -1,25 +1,23 @@
-mod support;
-
 use chrono::{Duration, Utc};
-use dandori_store::{OutboxFailureContext, StoreError};
+use dandori_store::{OutboxFailureClassification, OutboxFailureContext, StoreError};
+use dandori_test_support::{
+    auth_context, make_create_issue_command, make_issue_created_event, setup_database,
+};
 use sqlx::query;
 use uuid::Uuid;
 
-use support::{auth_context, make_command, make_event, setup_db};
-
 #[tokio::test]
 async fn outbox_lease_retry_dead_letter_and_retention_flow() {
-    let db = setup_db().await;
-    let _ = (db._workspace_b, db._workflow_a);
+    let db = setup_database().await;
 
-    let command = make_command(
+    let command = make_create_issue_command(
         db.workspace_a,
         db.project_a,
         Uuid::now_v7(),
         Uuid::now_v7(),
         "idem-outbox-flow",
     );
-    let event = make_event(&command);
+    let event = make_issue_created_event(&command);
 
     let auth = auth_context(db.workspace_a, command.actor_id);
 
@@ -42,6 +40,7 @@ async fn outbox_lease_retry_dead_letter_and_retention_flow() {
             &auth,
             leased.id,
             OutboxFailureContext {
+                classification: OutboxFailureClassification::Transient,
                 lease_token: leased.lease_token,
                 lease_owner: leased.lease_owner,
                 now: Utc::now(),
@@ -66,6 +65,7 @@ async fn outbox_lease_retry_dead_letter_and_retention_flow() {
             &auth,
             second_lease[0].id,
             OutboxFailureContext {
+                classification: OutboxFailureClassification::Transient,
                 lease_token: second_lease[0].lease_token,
                 lease_owner: second_lease[0].lease_owner,
                 now: Utc::now(),
@@ -101,8 +101,7 @@ async fn outbox_lease_retry_dead_letter_and_retention_flow() {
 
 #[tokio::test]
 async fn idempotency_cleanup_deletes_expired_rows() {
-    let db = setup_db().await;
-    let _ = (db._workspace_b, db._workflow_a);
+    let db = setup_database().await;
 
     query(
         "INSERT INTO idempotency_record (
@@ -138,18 +137,18 @@ async fn idempotency_cleanup_deletes_expired_rows() {
 
 #[tokio::test]
 async fn outbox_status_updates_require_matching_workspace_and_row() {
-    let db = setup_db().await;
+    let db = setup_database().await;
 
-    let command = make_command(
+    let command = make_create_issue_command(
         db.workspace_a,
         db.project_a,
         Uuid::now_v7(),
         Uuid::now_v7(),
         "idem-outbox-workspace-check",
     );
-    let event = make_event(&command);
+    let event = make_issue_created_event(&command);
     let auth_a = auth_context(db.workspace_a, command.actor_id);
-    let auth_b = auth_context(db._workspace_b, Uuid::now_v7());
+    let auth_b = auth_context(db.workspace_b, Uuid::now_v7());
 
     db.app_store
         .create_issue_transactional(&auth_a, &command, &event)
@@ -181,6 +180,7 @@ async fn outbox_status_updates_require_matching_workspace_and_row() {
             &auth_b,
             outbox_id,
             OutboxFailureContext {
+                classification: OutboxFailureClassification::Transient,
                 lease_token,
                 lease_owner,
                 now: Utc::now(),
@@ -196,15 +196,15 @@ async fn outbox_status_updates_require_matching_workspace_and_row() {
 
 #[tokio::test]
 async fn outbox_status_updates_reject_stale_duplicate_and_invalid_lease_identity() {
-    let db = setup_db().await;
-    let command = make_command(
+    let db = setup_database().await;
+    let command = make_create_issue_command(
         db.workspace_a,
         db.project_a,
         Uuid::now_v7(),
         Uuid::now_v7(),
         "idem-outbox-lease-guards",
     );
-    let event = make_event(&command);
+    let event = make_issue_created_event(&command);
     let auth = auth_context(db.workspace_a, command.actor_id);
 
     db.app_store

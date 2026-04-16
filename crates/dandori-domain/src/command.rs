@@ -11,6 +11,45 @@ const MAX_IDEMPOTENCY_KEY_LENGTH: usize = 128;
 const MAX_REQUEST_FINGERPRINT_LENGTH: usize = 128;
 const MAX_ISSUE_DESCRIPTION_LENGTH: usize = 4000;
 
+/// Stable, versioned command identifier used anywhere a command name crosses
+/// a process, storage, or wire boundary. The only sanctioned source of truth
+/// for command identifier strings; downstream code must route through
+/// [`CommandName::as_str`] / [`CommandName::parse`] so the compiler catches
+/// drift at build time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CommandName {
+    IssueCreateV1,
+    WorkspaceCreateV1,
+    ProjectCreateV1,
+}
+
+impl CommandName {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IssueCreateV1 => "issue.create.v1",
+            Self::WorkspaceCreateV1 => "workspace.create.v1",
+            Self::ProjectCreateV1 => "project.create.v1",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "issue.create.v1" => Some(Self::IssueCreateV1),
+            "workspace.create.v1" => Some(Self::WorkspaceCreateV1),
+            "project.create.v1" => Some(Self::ProjectCreateV1),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CommandName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum IssueCommandV1 {
@@ -19,10 +58,15 @@ pub enum IssueCommandV1 {
 
 impl IssueCommandV1 {
     #[must_use]
-    pub fn command_name(&self) -> &'static str {
+    pub fn name(&self) -> CommandName {
         match self {
-            Self::CreateIssue(_) => "issue.create.v1",
+            Self::CreateIssue(_) => CommandName::IssueCreateV1,
         }
+    }
+
+    #[must_use]
+    pub fn command_name(&self) -> &'static str {
+        self.name().as_str()
     }
 }
 
@@ -34,10 +78,15 @@ pub enum WorkspaceCommandV1 {
 
 impl WorkspaceCommandV1 {
     #[must_use]
-    pub fn command_name(&self) -> &'static str {
+    pub fn name(&self) -> CommandName {
         match self {
-            Self::CreateWorkspace(_) => "workspace.create.v1",
+            Self::CreateWorkspace(_) => CommandName::WorkspaceCreateV1,
         }
+    }
+
+    #[must_use]
+    pub fn command_name(&self) -> &'static str {
+        self.name().as_str()
     }
 }
 
@@ -75,10 +124,15 @@ pub enum ProjectCommandV1 {
 
 impl ProjectCommandV1 {
     #[must_use]
-    pub fn command_name(&self) -> &'static str {
+    pub fn name(&self) -> CommandName {
         match self {
-            Self::CreateProject(_) => "project.create.v1",
+            Self::CreateProject(_) => CommandName::ProjectCreateV1,
         }
+    }
+
+    #[must_use]
+    pub fn command_name(&self) -> &'static str {
+        self.name().as_str()
     }
 }
 
@@ -232,5 +286,29 @@ mod tests {
             .validate()
             .expect_err("oversized fingerprint must fail validation");
         assert!(matches!(error, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn command_name_round_trips_through_parse() {
+        for name in [
+            CommandName::IssueCreateV1,
+            CommandName::WorkspaceCreateV1,
+            CommandName::ProjectCreateV1,
+        ] {
+            assert_eq!(CommandName::parse(name.as_str()), Some(name));
+        }
+    }
+
+    #[test]
+    fn unknown_command_name_returns_none() {
+        assert_eq!(CommandName::parse("issue.create.v999"), None);
+        assert_eq!(CommandName::parse(""), None);
+    }
+
+    #[test]
+    fn command_enums_expose_typed_name() {
+        let command = IssueCommandV1::CreateIssue(base_create_issue_command());
+        assert_eq!(command.name(), CommandName::IssueCreateV1);
+        assert_eq!(command.command_name(), "issue.create.v1");
     }
 }

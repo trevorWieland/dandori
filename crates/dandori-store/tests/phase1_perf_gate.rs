@@ -1,13 +1,13 @@
-mod support;
-
 use std::cmp::Ordering;
 use std::time::Instant;
 
 use chrono::{Duration, Utc};
+use dandori_test_support::{
+    auth_context, make_create_issue_command as make_command,
+    make_issue_created_event as make_event, setup_database as setup_db,
+};
 use sqlx::query_scalar;
 use uuid::Uuid;
-
-use support::{auth_context, make_command, make_event, setup_db};
 
 #[tokio::test]
 async fn create_issue_write_path_meets_slo_p50_p95_and_throughput() {

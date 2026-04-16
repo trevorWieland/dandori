@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n               id as \"id!: Uuid\",\n               workspace_id as \"workspace_id!: Uuid\",\n               project_id as \"project_id!: Uuid\",\n               milestone_id as \"milestone_id: Uuid\",\n               title,\n               description,\n               state_category::text as \"state_category!\",\n               priority::text as \"priority!\",\n               archived_at as \"archived_at: DateTime<FixedOffset>\",\n               row_version,\n               created_at as \"created_at!: DateTime<FixedOffset>\",\n               updated_at as \"updated_at!: DateTime<FixedOffset>\"\n           FROM issue\n           WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: Uuid",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id!: Uuid",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "project_id!: Uuid",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "milestone_id: Uuid",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "state_category!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "priority!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "archived_at: DateTime<FixedOffset>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "row_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at!: DateTime<FixedOffset>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "updated_at!: DateTime<FixedOffset>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      null,
+      null,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "95bf2b7ea0bb6c740a271d691a85d877692f13249bdec09f0c127da04eaa0957"
+}

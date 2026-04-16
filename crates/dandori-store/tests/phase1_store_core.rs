@@ -1,14 +1,13 @@
-mod support;
-
 use dandori_store::{ProjectWriteInput, StoreError, WorkspaceWriteInput};
+use dandori_test_support::{
+    auth_context, make_create_issue_command, make_issue_created_event, setup_database,
+};
 use sqlx::{Row, query, query_scalar};
 use uuid::Uuid;
 
-use support::{auth_context, make_command, make_event, setup_db};
-
 #[tokio::test]
 async fn workspace_and_project_repository_read_write_respect_tenant_context() {
-    let db = setup_db().await;
+    let db = setup_database().await;
 
     let auth_a = auth_context(db.workspace_a, Uuid::now_v7());
 
@@ -29,7 +28,7 @@ async fn workspace_and_project_repository_read_write_respect_tenant_context() {
                 project_id: created_project_id,
                 workspace_id: db.workspace_a,
                 name: "project-created".to_owned(),
-                workflow_version_id: db._workflow_a,
+                workflow_version_id: db.workflow_a,
             },
         )
         .await
@@ -46,7 +45,7 @@ async fn workspace_and_project_repository_read_write_respect_tenant_context() {
 
     assert_eq!(fetched_project.name, "project-created");
 
-    let auth_b = auth_context(db._workspace_b, Uuid::now_v7());
+    let auth_b = auth_context(db.workspace_b, Uuid::now_v7());
     let cross_tenant = db
         .app_store
         .get_project(&auth_b, created_project_id)
@@ -58,7 +57,7 @@ async fn workspace_and_project_repository_read_write_respect_tenant_context() {
 
 #[tokio::test]
 async fn create_workspace_works_when_auth_workspace_matches_inserted_id() {
-    let db = setup_db().await;
+    let db = setup_database().await;
 
     let workspace_id = Uuid::now_v7();
     let auth = auth_context(workspace_id, Uuid::now_v7());
@@ -89,7 +88,7 @@ async fn create_workspace_works_when_auth_workspace_matches_inserted_id() {
 
 #[tokio::test]
 async fn create_project_requires_workflow_version_in_same_workspace() {
-    let db = setup_db().await;
+    let db = setup_database().await;
     let auth = auth_context(db.workspace_a, Uuid::now_v7());
 
     let error = db
@@ -111,19 +110,19 @@ async fn create_project_requires_workflow_version_in_same_workspace() {
 
 #[tokio::test]
 async fn rls_allows_same_tenant_and_denies_cross_tenant_reads() {
-    let db = setup_db().await;
+    let db = setup_database().await;
 
-    let command = make_command(
+    let command = make_create_issue_command(
         db.workspace_a,
         db.project_a,
         Uuid::now_v7(),
         Uuid::now_v7(),
         "idem-read",
     );
-    let event = make_event(&command);
+    let event = make_issue_created_event(&command);
 
     let auth_a = auth_context(db.workspace_a, command.actor_id);
-    let auth_b = auth_context(db._workspace_b, Uuid::now_v7());
+    let auth_b = auth_context(db.workspace_b, Uuid::now_v7());
 
     db.app_store
         .create_issue_transactional(&auth_a, &command, &event)
@@ -150,7 +149,7 @@ async fn rls_allows_same_tenant_and_denies_cross_tenant_reads() {
 
 #[tokio::test]
 async fn rls_denies_when_tenant_context_missing() {
-    let db = setup_db().await;
+    let db = setup_database().await;
 
     let count: i64 = query_scalar("SELECT COUNT(*) FROM workspace")
         .fetch_one(db.app_store.pool())
@@ -176,19 +175,19 @@ async fn rls_denies_when_tenant_context_missing() {
 
 #[tokio::test]
 async fn create_issue_is_idempotent_and_conflicts_on_changed_request_fingerprint() {
-    let db = setup_db().await;
+    let db = setup_database().await;
 
     let issue_id = Uuid::now_v7();
     let command_id = Uuid::now_v7();
 
-    let command = make_command(
+    let command = make_create_issue_command(
         db.workspace_a,
         db.project_a,
         issue_id,
         command_id,
         "idem-write",
     );
-    let event = make_event(&command);
+    let event = make_issue_created_event(&command);
     let auth = auth_context(db.workspace_a, command.actor_id);
 
     let first = db
@@ -208,14 +207,14 @@ async fn create_issue_is_idempotent_and_conflicts_on_changed_request_fingerprint
     assert!(replay.idempotent_replay);
     assert_eq!(replay.issue.id.0, issue_id);
 
-    let retry_like_command = make_command(
+    let retry_like_command = make_create_issue_command(
         db.workspace_a,
         db.project_a,
         Uuid::now_v7(),
         Uuid::now_v7(),
         "idem-write",
     );
-    let retry_like_event = make_event(&retry_like_command);
+    let retry_like_event = make_issue_created_event(&retry_like_command);
     let retry_replay = db
         .app_store
         .create_issue_transactional(&auth, &retry_like_command, &retry_like_event)
@@ -225,7 +224,7 @@ async fn create_issue_is_idempotent_and_conflicts_on_changed_request_fingerprint
     assert!(retry_replay.idempotent_replay);
     assert_eq!(retry_replay.issue.id.0, issue_id);
 
-    let mut conflicting = make_command(
+    let mut conflicting = make_create_issue_command(
         db.workspace_a,
         db.project_a,
         Uuid::now_v7(),
@@ -233,7 +232,7 @@ async fn create_issue_is_idempotent_and_conflicts_on_changed_request_fingerprint
         "idem-write",
     );
     conflicting.request_fingerprint = "changed-fingerprint".to_owned();
-    let conflicting_event = make_event(&conflicting);
+    let conflicting_event = make_issue_created_event(&conflicting);
 
     let error = db
         .app_store
@@ -246,17 +245,17 @@ async fn create_issue_is_idempotent_and_conflicts_on_changed_request_fingerprint
 
 #[tokio::test]
 async fn failed_create_does_not_write_activity_or_outbox() {
-    let db = setup_db().await;
+    let db = setup_database().await;
 
-    let bad_command = make_command(
-        db._workspace_b,
+    let bad_command = make_create_issue_command(
+        db.workspace_b,
         db.project_a,
         Uuid::now_v7(),
         Uuid::now_v7(),
         "idem-fail",
     );
-    let event = make_event(&bad_command);
-    let auth = auth_context(db._workspace_b, bad_command.actor_id);
+    let event = make_issue_created_event(&bad_command);
+    let auth = auth_context(db.workspace_b, bad_command.actor_id);
 
     let error = db
         .app_store
@@ -286,10 +285,10 @@ async fn failed_create_does_not_write_activity_or_outbox() {
 
 #[tokio::test]
 async fn create_issue_enforces_milestone_workspace_and_project_consistency() {
-    let db = setup_db().await;
+    let db = setup_database().await;
     let auth = auth_context(db.workspace_a, Uuid::now_v7());
 
-    let missing_milestone = make_command(
+    let missing_milestone = make_create_issue_command(
         db.workspace_a,
         db.project_a,
         Uuid::now_v7(),
@@ -298,7 +297,7 @@ async fn create_issue_enforces_milestone_workspace_and_project_consistency() {
     );
     let mut missing_milestone = missing_milestone;
     missing_milestone.milestone_id = Some(Uuid::now_v7().into());
-    let missing_event = make_event(&missing_milestone);
+    let missing_event = make_issue_created_event(&missing_milestone);
     let missing_error = db
         .app_store
         .create_issue_transactional(&auth, &missing_milestone, &missing_event)
@@ -325,12 +324,12 @@ async fn create_issue_enforces_milestone_workspace_and_project_consistency() {
     )
     .bind(other_project_id)
     .bind(db.workspace_a)
-    .bind(db._workflow_a)
+    .bind(db.workflow_a)
     .execute(&db.admin_pool)
     .await
     .expect("seed second project in same workspace");
 
-    let mismatch_command = make_command(
+    let mismatch_command = make_create_issue_command(
         db.workspace_a,
         other_project_id,
         Uuid::now_v7(),
@@ -339,7 +338,7 @@ async fn create_issue_enforces_milestone_workspace_and_project_consistency() {
     );
     let mut mismatch_command = mismatch_command;
     mismatch_command.milestone_id = Some(milestone_id.into());
-    let mismatch_event = make_event(&mismatch_command);
+    let mismatch_event = make_issue_created_event(&mismatch_command);
 
     let mismatch_error = db
         .app_store
@@ -354,7 +353,7 @@ async fn create_issue_enforces_milestone_workspace_and_project_consistency() {
 
 #[tokio::test]
 async fn composite_foreign_keys_block_cross_tenant_relations() {
-    let db = setup_db().await;
+    let db = setup_database().await;
 
     let cross_tenant_project_insert = query(
         "INSERT INTO project (id, workspace_id, name, workflow_version_id)
@@ -381,7 +380,7 @@ async fn composite_foreign_keys_block_cross_tenant_relations() {
     )
     .bind(Uuid::now_v7())
     .bind(db.workspace_a)
-    .bind(db._project_b)
+    .bind(db.project_b)
     .execute(&db.admin_pool)
     .await
     .expect_err("cross-tenant issue->project linkage must fail");
@@ -396,9 +395,9 @@ async fn composite_foreign_keys_block_cross_tenant_relations() {
 
 #[tokio::test]
 async fn issue_create_rejects_oversized_description_with_database_constraint() {
-    let db = setup_db().await;
+    let db = setup_database().await;
     let auth = auth_context(db.workspace_a, Uuid::now_v7());
-    let mut command = make_command(
+    let mut command = make_create_issue_command(
         db.workspace_a,
         db.project_a,
         Uuid::now_v7(),
@@ -406,7 +405,7 @@ async fn issue_create_rejects_oversized_description_with_database_constraint() {
         "oversized-description",
     );
     command.description = Some("x".repeat(4001));
-    let event = make_event(&command);
+    let event = make_issue_created_event(&command);
 
     let error = db
         .app_store
@@ -419,9 +418,9 @@ async fn issue_create_rejects_oversized_description_with_database_constraint() {
 
 #[tokio::test]
 async fn issue_create_rejects_oversized_fingerprint_with_database_constraint() {
-    let db = setup_db().await;
+    let db = setup_database().await;
     let auth = auth_context(db.workspace_a, Uuid::now_v7());
-    let mut command = make_command(
+    let mut command = make_create_issue_command(
         db.workspace_a,
         db.project_a,
         Uuid::now_v7(),
@@ -429,7 +428,7 @@ async fn issue_create_rejects_oversized_fingerprint_with_database_constraint() {
         "oversized-fingerprint",
     );
     command.request_fingerprint = "x".repeat(129);
-    let event = make_event(&command);
+    let event = make_issue_created_event(&command);
 
     let error = db
         .app_store

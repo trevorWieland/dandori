@@ -7,6 +7,10 @@
 //! - [`WorkspaceEventV1`]
 //! - [`ProjectCommandV1`]
 //! - [`ProjectEventV1`]
+//!
+//! Typed identifier contracts:
+//! - [`CommandName`] — stable command identifier enum
+//! - [`EventType`] — stable event identifier enum
 
 mod auth;
 mod command;
@@ -17,15 +21,15 @@ mod model;
 
 pub use auth::AuthContext;
 pub use command::{
-    CreateIssueCommandV1, CreateProjectCommandV1, CreateWorkspaceCommandV1, IssueCommandV1,
-    ProjectCommandV1, WorkspaceCommandV1,
+    CommandName, CreateIssueCommandV1, CreateProjectCommandV1, CreateWorkspaceCommandV1,
+    IssueCommandV1, ProjectCommandV1, WorkspaceCommandV1,
 };
 pub use error::{
     AuthzError, ConflictError, DomainError, InfrastructureError, PreconditionError,
     TenantBoundaryError, ValidationError,
 };
 pub use event::{
-    IssueCreatedEventV1, IssueEventV1, ProjectCreatedEventV1, ProjectEventV1,
+    EventType, IssueCreatedEventV1, IssueEventV1, ProjectCreatedEventV1, ProjectEventV1,
     WorkspaceCreatedEventV1, WorkspaceEventV1,
 };
 pub use ids::{

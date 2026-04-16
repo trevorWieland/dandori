@@ -5,12 +5,10 @@ use chrono::Utc;
 use dandori_api::{ApiState, build_router};
 use dandori_app_services::build_issue_service;
 use dandori_auth::JwtAuthenticator;
+use dandori_test_support::setup_database;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sqlx::PgPool;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::postgres::Postgres;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use uuid::Uuid;
@@ -61,80 +59,10 @@ impl McpSession {
 
 #[tokio::test]
 async fn rest_and_mcp_wire_paths_have_parity_for_malformed_and_auth_errors() {
-    let container = Postgres::default().start().await.expect("start postgres");
-    let host = container.get_host().await.expect("host");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-
-    let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    let _ = build_issue_service(&admin_url, true)
-        .await
-        .expect("migrate");
-
-    let admin_pool = PgPool::connect(&admin_url).await.expect("connect admin");
-
-    sqlx::query(
-        "DO $$
-            BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dandori_app') THEN
-                    CREATE ROLE dandori_app
-                        LOGIN
-                        PASSWORD 'dandori_app'
-                        NOSUPERUSER
-                        NOCREATEDB
-                        NOCREATEROLE
-                        NOBYPASSRLS;
-                END IF;
-            END
-        $$;",
-    )
-    .execute(&admin_pool)
-    .await
-    .expect("create app role");
-
-    sqlx::query("GRANT USAGE ON SCHEMA public TO dandori_app")
-        .execute(&admin_pool)
-        .await
-        .expect("grant schema usage");
-
-    sqlx::query(
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO dandori_app",
-    )
-    .execute(&admin_pool)
-    .await
-    .expect("grant table perms");
-
-    let workspace_id = Uuid::now_v7();
-    let workflow_id = Uuid::now_v7();
-    let project_id = Uuid::now_v7();
-
-    sqlx::query("INSERT INTO workspace (id, name) VALUES ($1, 'ws-a')")
-        .bind(workspace_id)
-        .execute(&admin_pool)
-        .await
-        .expect("seed workspace");
-
-    sqlx::query(
-        "INSERT INTO workflow_version (id, workspace_id, name, version, checksum, states, transitions)
-         VALUES ($1, $2, 'default', 1, 'sha256:a', '[]'::jsonb, '[]'::jsonb)",
-    )
-    .bind(workflow_id)
-    .bind(workspace_id)
-    .execute(&admin_pool)
-    .await
-    .expect("seed workflow");
-
-    sqlx::query(
-        "INSERT INTO project (id, workspace_id, name, workflow_version_id)
-         VALUES ($1, $2, 'project-a', $3)",
-    )
-    .bind(project_id)
-    .bind(workspace_id)
-    .bind(workflow_id)
-    .execute(&admin_pool)
-    .await
-    .expect("seed project");
-
-    let app_url = format!("postgres://dandori_app:dandori_app@{host}:{port}/postgres");
+    let db = setup_database().await;
+    let workspace_id = db.workspace_a;
+    let project_id = db.project_a;
+    let app_url = db.app_database_url.clone();
 
     let service = build_issue_service(&app_url, false)
         .await

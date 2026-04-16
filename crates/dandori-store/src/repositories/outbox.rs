@@ -3,7 +3,7 @@ use dandori_domain::AuthContext;
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::pg_store::{OutboxFailureContext, OutboxMessage, PgStore};
+use crate::pg_store::{OutboxFailureClassification, OutboxFailureContext, OutboxMessage, PgStore};
 use crate::{StoreError, repositories::common::set_workspace_context_tx};
 
 #[derive(Debug)]
@@ -216,8 +216,14 @@ pub(crate) async fn mark_outbox_failed(
     )?;
 
     let next_attempts = lease.attempts + 1;
+    let exhausted_budget = next_attempts >= failure.max_attempts;
+    let terminal = matches!(
+        failure.classification,
+        OutboxFailureClassification::Terminal
+    );
+    let dead_letter_now = terminal || exhausted_budget;
 
-    let rows_affected = if next_attempts >= failure.max_attempts {
+    let rows_affected = if dead_letter_now {
         sqlx::query!(
             r#"UPDATE outbox
                SET status = 'dead_letter'::outbox_status,

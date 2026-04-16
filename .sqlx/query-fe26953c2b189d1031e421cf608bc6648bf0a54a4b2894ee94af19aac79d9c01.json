@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH candidates AS (\n               SELECT w.id\n               FROM list_workspace_ids_for_partition_lease() AS w(id)\n               WHERE NOT EXISTS (\n                   SELECT 1\n                   FROM worker_partition_lease l\n                   WHERE l.workspace_id = w.id\n                     AND l.leased_until > $1\n                     AND l.lease_owner <> $3\n               )\n               ORDER BY w.id\n               LIMIT $2\n           )\n           INSERT INTO worker_partition_lease\n               (workspace_id, lease_owner, leased_at, leased_until, updated_at)\n           SELECT id, $3, $1, $4, $1 FROM candidates\n           ON CONFLICT (workspace_id) DO UPDATE\n               SET lease_owner = excluded.lease_owner,\n                   leased_at = excluded.leased_at,\n                   leased_until = excluded.leased_until,\n                   updated_at = excluded.updated_at\n               WHERE worker_partition_lease.leased_until <= excluded.leased_at\n                  OR worker_partition_lease.lease_owner = excluded.lease_owner\n           RETURNING workspace_id as \"workspace_id!: Uuid\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_id!: Uuid",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Int8",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fe26953c2b189d1031e421cf608bc6648bf0a54a4b2894ee94af19aac79d9c01"
+}

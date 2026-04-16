@@ -1,13 +1,12 @@
-mod support;
-
+use dandori_test_support::{
+    auth_context, make_create_issue_command, make_issue_created_event, setup_database,
+};
 use sqlx::{Row, query};
 use uuid::Uuid;
 
-use support::{auth_context, make_command, make_event, setup_db};
-
 #[tokio::test]
 async fn fault_injection_after_issue_insert_rolls_back_issue_activity_outbox_and_idempotency() {
-    let db = setup_db().await;
+    let db = setup_database().await;
 
     query(
         "CREATE OR REPLACE FUNCTION test_fail_outbox_insert() RETURNS trigger AS $$
@@ -30,14 +29,14 @@ async fn fault_injection_after_issue_insert_rolls_back_issue_activity_outbox_and
     .await
     .expect("create test trigger");
 
-    let command = make_command(
+    let command = make_create_issue_command(
         db.workspace_a,
         db.project_a,
         Uuid::now_v7(),
         Uuid::now_v7(),
         "idem-fault-inject",
     );
-    let event = make_event(&command);
+    let event = make_issue_created_event(&command);
     let auth = auth_context(db.workspace_a, command.actor_id);
 
     let _error = db

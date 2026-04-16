@@ -79,16 +79,42 @@ Phase 1 integration tests require Docker (for ephemeral PostgreSQL testcontainer
 
 ## Worker Publisher Runtime
 
-The worker supports a concrete HTTP publisher adapter.
+The worker routes typed outbox events (`EventType::IssueCreatedV1`) through a
+pluggable publisher. The default startup policy is **fail-closed**: the worker
+refuses to run without an explicit publisher configuration.
 
-- `DANDORI_OUTBOX_PUBLISH_URL` (optional)
-  - when set: worker publishes `issue.created.v1` envelopes to this URL
-  - when unset: worker uses a no-op publisher for local/dev flows
-- Worker shard config:
-  - `DANDORI_WORKER_WORKSPACE_IDS` (required, comma-separated UUIDs)
-  - `DANDORI_WORKER_SHARD_INDEX` (optional, default `0`)
-  - `DANDORI_WORKER_SHARD_TOTAL` (optional, default `1`)
-  - `DANDORI_WORKER_INSTANCE_ID` (optional UUID, defaults to generated value)
+- `DANDORI_OUTBOX_PUBLISH_URL` (required for production)
+  - when set: worker publishes envelopes to this URL via the hardened HTTP
+    publisher (explicit connect + request timeouts, bounded connection pool,
+    and an in-process circuit breaker).
+- `DANDORI_OUTBOX_ALLOW_NOOP_PUBLISHER` (dev escape hatch only)
+  - set to `1` or `true` to explicitly opt in to the no-op publisher when
+    `DANDORI_OUTBOX_PUBLISH_URL` is unset. The worker logs a warning on every
+    start. Never set this in production.
+- Transport tuning (optional):
+  - `DANDORI_WORKER_HTTP_CONNECT_TIMEOUT_MS` (default `2000`)
+  - `DANDORI_WORKER_HTTP_REQUEST_TIMEOUT_MS` (default `10000`)
+  - `DANDORI_WORKER_PUBLISH_CONCURRENCY` (default `8`)
+  - `DANDORI_WORKER_RETRY_JITTER_MS` (default `2000`)
+  - `DANDORI_WORKER_CIRCUIT_FAILURE_THRESHOLD` (default `10`)
+  - `DANDORI_WORKER_CIRCUIT_COOLDOWN_SECONDS` (default `30`)
+- Dynamic partition leasing (replaces the former static workspace list):
+  - `DANDORI_WORKER_INSTANCE_ID` (optional UUID; strongly recommended for
+    stable lease ownership across restarts)
+  - `DANDORI_WORKER_PARTITION_BATCH` (default `64`)
+  - `DANDORI_WORKER_PARTITION_LEASE_SECONDS` (default `60`)
+
+Workers discover workspaces directly from the database and acquire leases on
+`worker_partition_lease` rows atomically (`INSERT … ON CONFLICT DO UPDATE
+WHERE leased_until <= now`). Multiple workers can run in parallel without any
+external coordinator and without a static sharding configuration.
+
+## Failure Classification
+
+Outbox publish failures are classified into transient vs terminal. Transient
+errors (5xx, network, breaker open) honour the retry budget and backoff with
+jitter. Terminal errors (4xx, unknown event type, serialization) dead-letter
+immediately so the DLQ stays meaningful and the retry queue does not bloat.
 
 ## Workspace Layout
 
