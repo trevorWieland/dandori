@@ -1,36 +1,19 @@
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use dandori_domain::{
     AuthContext, CreateIssueCommandV1, Issue, IssueCreatedEventV1, IssuePriority,
     IssueStateCategory,
 };
-use serde_json::json;
-use sqlx::{Postgres, Transaction};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction,
+    EntityTrait, QueryFilter, QueryResult, Set, Statement, TransactionTrait,
+};
 use uuid::Uuid;
 
+use crate::entities::{activity, idempotency_record, milestone, project};
 use crate::pg_store::{CreateIssueWriteResult, IdempotencyResponse, PgStore};
-use crate::{StoreError, repositories::common::set_workspace_context_tx};
+use crate::{StoreError, repositories::common::set_workspace_context_db};
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct IssueRow {
-    id: Uuid,
-    workspace_id: Uuid,
-    project_id: Uuid,
-    milestone_id: Option<Uuid>,
-    title: String,
-    description: Option<String>,
-    state_category: String,
-    priority: String,
-    archived_at: Option<DateTime<Utc>>,
-    row_version: i64,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct IdempotencyRow {
-    request_fingerprint: String,
-    response_payload: serde_json::Value,
-}
+const ISSUE_CREATE_COMMAND_NAME: &str = "issue.create.v1";
 
 pub(crate) async fn create_issue_transactional(
     store: &PgStore,
@@ -38,22 +21,19 @@ pub(crate) async fn create_issue_transactional(
     command: &CreateIssueCommandV1,
     event: &IssueCreatedEventV1,
 ) -> Result<CreateIssueWriteResult, StoreError> {
-    let mut tx = store.pool().begin().await?;
-    set_workspace_context_tx(&mut tx, auth.workspace_id.0).await?;
+    let tx = store.db().begin().await?;
+    set_workspace_context_db(&tx, auth.workspace_id.0).await?;
 
-    let maybe_idempotency = sqlx::query_as::<_, IdempotencyRow>(
-        "SELECT request_fingerprint, response_payload
-         FROM idempotency_record
-         WHERE workspace_id = $1 AND command_name = $2 AND idempotency_key = $3",
-    )
-    .bind(command.workspace_id.0)
-    .bind("issue.create.v1")
-    .bind(command.idempotency_key.as_str())
-    .fetch_optional(tx.as_mut())
+    let maybe_idempotency = idempotency_record::Entity::find_by_id((
+        command.workspace_id.0,
+        ISSUE_CREATE_COMMAND_NAME.to_owned(),
+        command.idempotency_key.as_str().to_owned(),
+    ))
+    .one(&tx)
     .await?;
 
     if let Some(existing) = maybe_idempotency {
-        if existing.request_fingerprint != command.request_fingerprint {
+        if !matches_request_fingerprint(existing.request_fingerprint.as_str(), command) {
             return Err(StoreError::IdempotencyConflict);
         }
         let replay: IdempotencyResponse = serde_json::from_value(existing.response_payload)?;
@@ -64,38 +44,33 @@ pub(crate) async fn create_issue_transactional(
         });
     }
 
-    let project_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM project
-            WHERE id = $1 AND workspace_id = $2
-        )",
-    )
-    .bind(command.project_id.0)
-    .bind(command.workspace_id.0)
-    .fetch_one(tx.as_mut())
-    .await?;
+    let project_exists = project::Entity::find()
+        .filter(project::Column::Id.eq(command.project_id.0))
+        .filter(project::Column::WorkspaceId.eq(command.workspace_id.0))
+        .one(&tx)
+        .await?
+        .is_some();
     if !project_exists {
         return Err(StoreError::ProjectNotFound);
     }
 
     if let Some(milestone_id) = command.milestone_id {
-        let milestone_project: Option<Uuid> = sqlx::query_scalar(
-            "SELECT project_id
-             FROM milestone
-             WHERE id = $1 AND workspace_id = $2",
-        )
-        .bind(milestone_id.0)
-        .bind(command.workspace_id.0)
-        .fetch_optional(tx.as_mut())
-        .await?;
-        let milestone_project = milestone_project.ok_or(StoreError::MilestoneNotFound)?;
-        if milestone_project != command.project_id.0 {
+        let milestone_model = milestone::Entity::find()
+            .filter(milestone::Column::Id.eq(milestone_id.0))
+            .filter(milestone::Column::WorkspaceId.eq(command.workspace_id.0))
+            .one(&tx)
+            .await?;
+
+        let milestone_model = milestone_model.ok_or(StoreError::MilestoneNotFound)?;
+        if milestone_model.project_id != command.project_id.0 {
             return Err(StoreError::MilestoneProjectMismatch);
         }
     }
 
-    sqlx::query(
+    let occurred_at = event.occurred_at.fixed_offset();
+
+    tx.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
         "INSERT INTO issue (
             id,
             workspace_id,
@@ -123,44 +98,35 @@ pub(crate) async fn create_issue_transactional(
             $8,
             $8
         )",
-    )
-    .bind(command.issue_id.0)
-    .bind(command.workspace_id.0)
-    .bind(command.project_id.0)
-    .bind(command.milestone_id.map(|value| value.0))
-    .bind(command.title.as_str())
-    .bind(command.description.as_ref())
-    .bind(priority_as_str(command.priority))
-    .bind(event.occurred_at)
-    .execute(tx.as_mut())
+        vec![
+            command.issue_id.0.into(),
+            command.workspace_id.0.into(),
+            command.project_id.0.into(),
+            command.milestone_id.map(|value| value.0).into(),
+            command.title.clone().into(),
+            command.description.clone().into(),
+            priority_as_str(command.priority).to_owned().into(),
+            occurred_at.into(),
+        ],
+    ))
     .await?;
 
-    sqlx::query(
-        "INSERT INTO activity (
-            id,
-            workspace_id,
-            project_id,
-            issue_id,
-            command_id,
-            actor_id,
-            event_type,
-            event_payload,
-            created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-    )
-    .bind(Uuid::now_v7())
-    .bind(command.workspace_id.0)
-    .bind(command.project_id.0)
-    .bind(command.issue_id.0)
-    .bind(command.command_id.0)
-    .bind(command.actor_id)
-    .bind("issue.created.v1")
-    .bind(json!(event))
-    .bind(event.occurred_at)
-    .execute(tx.as_mut())
+    activity::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        workspace_id: Set(command.workspace_id.0),
+        project_id: Set(command.project_id.0),
+        issue_id: Set(Some(command.issue_id.0)),
+        command_id: Set(command.command_id.0),
+        actor_id: Set(command.actor_id),
+        event_type: Set("issue.created.v1".to_owned()),
+        event_payload: Set(serde_json::json!(event)),
+        created_at: Set(occurred_at),
+    }
+    .insert(&tx)
     .await?;
 
-    sqlx::query(
+    tx.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
         "INSERT INTO outbox (
             id,
             workspace_id,
@@ -176,6 +142,8 @@ pub(crate) async fn create_issue_transactional(
             status,
             leased_at,
             leased_until,
+            lease_token,
+            lease_owner,
             published_at,
             last_error,
             created_at,
@@ -197,48 +165,43 @@ pub(crate) async fn create_issue_transactional(
             NULL,
             NULL,
             NULL,
+            NULL,
+            NULL,
             $10,
             $10
         )",
-    )
-    .bind(Uuid::now_v7())
-    .bind(command.workspace_id.0)
-    .bind(event.event_id)
-    .bind("issue.created.v1")
-    .bind("issue")
-    .bind(command.issue_id.0)
-    .bind(event.occurred_at)
-    .bind(command.command_id.0)
-    .bind(json!(event))
-    .bind(event.occurred_at)
-    .execute(tx.as_mut())
+        vec![
+            Uuid::now_v7().into(),
+            command.workspace_id.0.into(),
+            event.event_id.into(),
+            "issue.created.v1".to_owned().into(),
+            "issue".to_owned().into(),
+            command.issue_id.0.into(),
+            occurred_at.into(),
+            command.command_id.0.into(),
+            serde_json::json!(event).into(),
+            occurred_at.into(),
+        ],
+    ))
     .await?;
 
-    let issue = fetch_issue_in_tx(&mut tx, command.issue_id.0)
+    let issue = fetch_issue_in_tx(&tx, command.issue_id.0)
         .await?
         .ok_or(StoreError::IdempotencyReplayMissingIssue)?;
 
-    sqlx::query(
-        "INSERT INTO idempotency_record (
-            workspace_id,
-            command_name,
-            idempotency_key,
-            request_fingerprint,
-            response_payload,
-            expires_at,
-            created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-    )
-    .bind(command.workspace_id.0)
-    .bind("issue.create.v1")
-    .bind(command.idempotency_key.as_str())
-    .bind(command.request_fingerprint.as_str())
-    .bind(json!(IdempotencyResponse {
-        issue: issue.clone(),
-    }))
-    .bind(Utc::now() + Duration::days(7))
-    .bind(Utc::now())
-    .execute(tx.as_mut())
+    let idempotency_now = Utc::now().fixed_offset();
+    idempotency_record::ActiveModel {
+        workspace_id: Set(command.workspace_id.0),
+        command_name: Set(ISSUE_CREATE_COMMAND_NAME.to_owned()),
+        idempotency_key: Set(command.idempotency_key.as_str().to_owned()),
+        request_fingerprint: Set(command.request_fingerprint.clone()),
+        response_payload: Set(serde_json::json!(IdempotencyResponse {
+            issue: issue.clone(),
+        })),
+        expires_at: Set((Utc::now() + Duration::days(7)).fixed_offset()),
+        created_at: Set(idempotency_now),
+    }
+    .insert(&tx)
     .await?;
 
     tx.commit().await?;
@@ -254,55 +217,63 @@ pub(crate) async fn get_issue(
     auth: &AuthContext,
     issue_id: Uuid,
 ) -> Result<Option<Issue>, StoreError> {
-    let mut tx = store.pool().begin().await?;
-    set_workspace_context_tx(&mut tx, auth.workspace_id.0).await?;
-    let issue = fetch_issue_in_tx(&mut tx, issue_id).await?;
+    let tx = store.db().begin().await?;
+    set_workspace_context_db(&tx, auth.workspace_id.0).await?;
+    let issue = fetch_issue_in_tx(&tx, issue_id).await?;
     tx.commit().await?;
     Ok(issue)
 }
 
 async fn fetch_issue_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &DatabaseTransaction,
     issue_id: Uuid,
 ) -> Result<Option<Issue>, StoreError> {
-    let row = sqlx::query_as::<_, IssueRow>(
-        "SELECT
-            id,
-            workspace_id,
-            project_id,
-            milestone_id,
-            title,
-            description,
-            state_category::text AS state_category,
-            priority::text AS priority,
-            archived_at,
-            row_version,
-            created_at,
-            updated_at
-        FROM issue
-        WHERE id = $1",
-    )
-    .bind(issue_id)
-    .fetch_optional(tx.as_mut())
-    .await?;
-
+    let row = tx
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"SELECT
+                   id,
+                   workspace_id,
+                   project_id,
+                   milestone_id,
+                   title,
+                   description,
+                   state_category::text AS state_category,
+                   priority::text AS priority,
+                   archived_at,
+                   row_version,
+                   created_at,
+                   updated_at
+               FROM issue
+               WHERE id = $1"#,
+            vec![issue_id.into()],
+        ))
+        .await?;
     row.map(map_issue_row).transpose()
 }
 
-fn map_issue_row(row: IssueRow) -> Result<Issue, StoreError> {
+fn map_issue_row(row: QueryResult) -> Result<Issue, StoreError> {
     Ok(Issue {
-        id: row.id.into(),
-        workspace_id: row.workspace_id.into(),
-        project_id: row.project_id.into(),
-        milestone_id: row.milestone_id.map(Into::into),
-        title: row.title,
-        description: row.description,
-        state_category: parse_state_category(row.state_category)?,
-        priority: parse_priority(row.priority)?,
-        archived_at: row.archived_at,
-        row_version: row.row_version,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
+        id: row.try_get::<Uuid>("", "id")?.into(),
+        workspace_id: row.try_get::<Uuid>("", "workspace_id")?.into(),
+        project_id: row.try_get::<Uuid>("", "project_id")?.into(),
+        milestone_id: row
+            .try_get::<Option<Uuid>>("", "milestone_id")?
+            .map(Into::into),
+        title: row.try_get("", "title")?,
+        description: row.try_get("", "description")?,
+        state_category: parse_state_category(row.try_get("", "state_category")?)?,
+        priority: parse_priority(row.try_get("", "priority")?)?,
+        archived_at: row
+            .try_get::<Option<chrono::DateTime<chrono::FixedOffset>>>("", "archived_at")?
+            .map(|value| value.with_timezone(&Utc)),
+        row_version: row.try_get("", "row_version")?,
+        created_at: row
+            .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "created_at")?
+            .with_timezone(&Utc),
+        updated_at: row
+            .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "updated_at")?
+            .with_timezone(&Utc),
     })
 }
 
@@ -333,4 +304,25 @@ fn priority_as_str(priority: IssuePriority) -> &'static str {
         IssuePriority::High => "high",
         IssuePriority::Urgent => "urgent",
     }
+}
+
+fn matches_request_fingerprint(existing: &str, command: &CreateIssueCommandV1) -> bool {
+    if existing == command.request_fingerprint {
+        return true;
+    }
+
+    !existing.starts_with("v2:") && existing == legacy_v1_fingerprint(command)
+}
+
+fn legacy_v1_fingerprint(command: &CreateIssueCommandV1) -> String {
+    format!(
+        "project_id={}|milestone_id={}|title={}|description={}|priority={}",
+        command.project_id.0,
+        command
+            .milestone_id
+            .map_or_else(|| "null".to_owned(), |id| id.0.to_string()),
+        command.title,
+        command.description.clone().unwrap_or_default(),
+        priority_as_str(command.priority),
+    )
 }

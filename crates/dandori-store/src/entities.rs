@@ -158,6 +158,8 @@ pub mod outbox {
         pub status: String,
         pub leased_at: Option<DateTimeWithTimeZone>,
         pub leased_until: Option<DateTimeWithTimeZone>,
+        pub lease_token: Option<Uuid>,
+        pub lease_owner: Option<Uuid>,
         pub published_at: Option<DateTimeWithTimeZone>,
         pub last_error: Option<String>,
         pub created_at: DateTimeWithTimeZone,

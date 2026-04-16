@@ -8,21 +8,45 @@ use uuid::Uuid;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let database_url = std::env::var("DANDORI_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let database_url =
+        std::env::var("DANDORI_DATABASE_URL").context("DANDORI_DATABASE_URL is required")?;
     let run_migrations = std::env::var("DANDORI_RUN_MIGRATIONS")
         .ok()
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
 
-    let workspace_id = std::env::var("DANDORI_WORKER_WORKSPACE_ID")
-        .context("DANDORI_WORKER_WORKSPACE_ID is required")
-        .and_then(|value| Uuid::parse_str(value.as_str()).context("invalid workspace uuid"))?;
+    let workspace_ids = std::env::var("DANDORI_WORKER_WORKSPACE_IDS")
+        .context("DANDORI_WORKER_WORKSPACE_IDS is required (comma-separated UUID list)")
+        .and_then(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| Uuid::parse_str(value).context("invalid workspace uuid in shard list"))
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+    if workspace_ids.is_empty() {
+        anyhow::bail!("DANDORI_WORKER_WORKSPACE_IDS must contain at least one workspace UUID");
+    }
 
-    let actor_id = std::env::var("DANDORI_WORKER_ACTOR_ID")
+    let shard_index = std::env::var("DANDORI_WORKER_SHARD_INDEX")
         .ok()
-        .map(|value| Uuid::parse_str(value.as_str()).context("invalid actor uuid"))
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    let shard_total = std::env::var("DANDORI_WORKER_SHARD_TOTAL")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(1)
+        .max(1);
+    if shard_index >= shard_total {
+        anyhow::bail!(
+            "DANDORI_WORKER_SHARD_INDEX ({shard_index}) must be less than DANDORI_WORKER_SHARD_TOTAL ({shard_total})"
+        );
+    }
+
+    let worker_instance_id = std::env::var("DANDORI_WORKER_INSTANCE_ID")
+        .ok()
+        .map(|value| Uuid::parse_str(value.as_str()).context("invalid worker instance uuid"))
         .transpose()?
-        .unwrap_or_else(Uuid::nil);
+        .unwrap_or_else(Uuid::now_v7);
 
     let interval_ms = std::env::var("DANDORI_WORKER_INTERVAL_MS")
         .ok()
@@ -30,8 +54,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(1_000);
 
     let config = OutboxWorkerConfig {
-        workspace_id,
-        actor_id,
+        workspace_ids,
+        shard_index,
+        shard_total,
+        worker_instance_id,
         batch_size: 32,
         lease_seconds: 30,
         max_attempts: 5,

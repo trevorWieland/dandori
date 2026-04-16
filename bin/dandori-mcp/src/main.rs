@@ -3,10 +3,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
 
-    let database_url = std::env::var("DANDORI_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let database_url =
+        std::env::var("DANDORI_DATABASE_URL").context("DANDORI_DATABASE_URL is required")?;
     let run_migrations = std::env::var("DANDORI_RUN_MIGRATIONS")
         .ok()
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));

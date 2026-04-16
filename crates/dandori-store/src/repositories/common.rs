@@ -8,10 +8,12 @@ pub(super) async fn set_workspace_context_tx(
     tx: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
 ) -> Result<(), StoreError> {
-    sqlx::query("SELECT set_config('app.workspace_id', $1, true)")
-        .bind(workspace_id.to_string())
-        .execute(tx.as_mut())
-        .await?;
+    sqlx::query!(
+        "SELECT set_config('app.workspace_id', $1, true)",
+        workspace_id.to_string()
+    )
+    .fetch_one(tx.as_mut())
+    .await?;
     Ok(())
 }
 

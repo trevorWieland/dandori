@@ -8,6 +8,8 @@ use dandori_domain::{
     IssueStateCategory,
 };
 use dandori_store::{PgStore, StoreError, migrate_database};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -46,7 +48,7 @@ impl IssueAppService {
         auth: &AuthContext,
         request: CreateIssueRequest,
     ) -> Result<CreateIssueResponse, AppServiceError> {
-        let request_fingerprint = create_issue_fingerprint(&request);
+        let request_fingerprint = create_issue_fingerprint(&request)?;
         let command = CreateIssueCommandV1 {
             command_id: CommandId(Uuid::now_v7()),
             idempotency_key: dandori_domain::IdempotencyKey(request.idempotency_key),
@@ -271,17 +273,34 @@ pub fn validation_error(code: &'static str, message: String) -> AppServiceError 
     }
 }
 
-fn create_issue_fingerprint(request: &CreateIssueRequest) -> String {
-    format!(
-        "project_id={}|milestone_id={}|title={}|description={}|priority={}",
-        request.project_id,
-        request
-            .milestone_id
-            .map_or_else(|| "null".to_owned(), |id| id.to_string()),
-        request.title,
-        request.description.clone().unwrap_or_default(),
-        priority_literal(request.priority),
-    )
+fn create_issue_fingerprint(request: &CreateIssueRequest) -> Result<String, AppServiceError> {
+    #[derive(Serialize)]
+    struct FingerprintPayload<'a> {
+        schema: &'static str,
+        project_id: Uuid,
+        milestone_id: Option<Uuid>,
+        title: &'a str,
+        description: Option<&'a str>,
+        priority: &'static str,
+    }
+
+    let payload = FingerprintPayload {
+        schema: "issue.create.fingerprint.v2",
+        project_id: request.project_id,
+        milestone_id: request.milestone_id,
+        title: request.title.as_str(),
+        description: request.description.as_deref(),
+        priority: priority_literal(request.priority),
+    };
+
+    let bytes = serde_json::to_vec(&payload).map_err(|error| AppServiceError {
+        code: "fingerprint_serialize_failed",
+        message: format!("failed to serialize idempotency fingerprint payload: {error}"),
+        kind: ErrorKind::Infrastructure,
+    })?;
+
+    let digest = Sha256::digest(bytes);
+    Ok(format!("v2:{}", hex::encode(digest)))
 }
 
 fn priority_literal(priority: IssuePriorityDto) -> &'static str {
@@ -290,5 +309,42 @@ fn priority_literal(priority: IssuePriorityDto) -> &'static str {
         IssuePriorityDto::Medium => "medium",
         IssuePriorityDto::High => "high",
         IssuePriorityDto::Urgent => "urgent",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_request() -> CreateIssueRequest {
+        CreateIssueRequest {
+            idempotency_key: "idem".to_owned(),
+            project_id: Uuid::now_v7(),
+            milestone_id: None,
+            title: "title".to_owned(),
+            description: None,
+            priority: IssuePriorityDto::Medium,
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_versioned_and_hash_based() {
+        let request = base_request();
+        let fingerprint = create_issue_fingerprint(&request).expect("fingerprint");
+        assert!(fingerprint.starts_with("v2:"));
+        assert_eq!(fingerprint.len(), 67);
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_none_and_empty_description() {
+        let request_none = base_request();
+        let mut request_empty = base_request();
+        request_empty.description = Some(String::new());
+
+        let none_fingerprint = create_issue_fingerprint(&request_none).expect("none fingerprint");
+        let empty_fingerprint =
+            create_issue_fingerprint(&request_empty).expect("empty fingerprint");
+
+        assert_ne!(none_fingerprint, empty_fingerprint);
     }
 }

@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE outbox\n               SET status = 'failed'::outbox_status,\n                   attempts = $1,\n                   available_at = $2,\n                   leased_at = NULL,\n                   leased_until = NULL,\n                   lease_token = NULL,\n                   lease_owner = NULL,\n                   updated_at = $3,\n                   last_error = $4\n               WHERE workspace_id = $5\n                 AND id = $6\n                 AND status = 'leased'::outbox_status\n                 AND lease_token = $7\n                 AND lease_owner = $8\n                 AND leased_until > $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Timestamptz",
+        "Timestamptz",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1030ce69e6584e7adb99e9227af2a2239e768e088fa71f9b998aac4b8957d05f"
+}

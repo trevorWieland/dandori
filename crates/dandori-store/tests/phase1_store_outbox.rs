@@ -1,7 +1,7 @@
 mod support;
 
 use chrono::{Duration, Utc};
-use dandori_store::StoreError;
+use dandori_store::{OutboxFailureContext, StoreError};
 use sqlx::query;
 use uuid::Uuid;
 
@@ -41,10 +41,14 @@ async fn outbox_lease_retry_dead_letter_and_retention_flow() {
         .mark_outbox_failed(
             &auth,
             leased.id,
-            Utc::now(),
-            "first failure",
-            2,
-            Duration::seconds(0),
+            OutboxFailureContext {
+                lease_token: leased.lease_token,
+                lease_owner: leased.lease_owner,
+                now: Utc::now(),
+                error_message: "first failure".to_owned(),
+                max_attempts: 2,
+                retry_backoff: Duration::seconds(0),
+            },
         )
         .await
         .expect("mark failed");
@@ -61,10 +65,14 @@ async fn outbox_lease_retry_dead_letter_and_retention_flow() {
         .mark_outbox_failed(
             &auth,
             second_lease[0].id,
-            Utc::now(),
-            "second failure",
-            2,
-            Duration::seconds(0),
+            OutboxFailureContext {
+                lease_token: second_lease[0].lease_token,
+                lease_owner: second_lease[0].lease_owner,
+                now: Utc::now(),
+                error_message: "second failure".to_owned(),
+                max_attempts: 2,
+                retry_backoff: Duration::seconds(0),
+            },
         )
         .await
         .expect("mark dead letter");
@@ -155,14 +163,16 @@ async fn outbox_status_updates_require_matching_workspace_and_row() {
         .expect("lease");
 
     let outbox_id = leased[0].id;
+    let lease_token = leased[0].lease_token;
+    let lease_owner = leased[0].lease_owner;
     let delivered_err = db
         .app_store
-        .mark_outbox_delivered(&auth_b, outbox_id, Utc::now())
+        .mark_outbox_delivered(&auth_b, outbox_id, lease_token, lease_owner, Utc::now())
         .await
         .expect_err("cross-workspace delivery update should fail");
     assert!(matches!(
         delivered_err,
-        StoreError::OutboxUpdateNotSingleRow { .. }
+        StoreError::OutboxLeaseMissing { .. }
     ));
 
     let failed_err = db
@@ -170,15 +180,116 @@ async fn outbox_status_updates_require_matching_workspace_and_row() {
         .mark_outbox_failed(
             &auth_b,
             outbox_id,
-            Utc::now(),
-            "cross workspace",
-            3,
-            Duration::seconds(0),
+            OutboxFailureContext {
+                lease_token,
+                lease_owner,
+                now: Utc::now(),
+                error_message: "cross workspace".to_owned(),
+                max_attempts: 3,
+                retry_backoff: Duration::seconds(0),
+            },
         )
         .await
         .expect_err("cross-workspace failure update should fail");
+    assert!(matches!(failed_err, StoreError::OutboxLeaseMissing { .. }));
+}
+
+#[tokio::test]
+async fn outbox_status_updates_reject_stale_duplicate_and_invalid_lease_identity() {
+    let db = setup_db().await;
+    let command = make_command(
+        db.workspace_a,
+        db.project_a,
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        "idem-outbox-lease-guards",
+    );
+    let event = make_event(&command);
+    let auth = auth_context(db.workspace_a, command.actor_id);
+
+    db.app_store
+        .create_issue_transactional(&auth, &command, &event)
+        .await
+        .expect("create issue");
+
+    let leased = db
+        .app_store
+        .lease_outbox_batch(&auth, Utc::now(), Duration::seconds(30), 10)
+        .await
+        .expect("lease");
+    assert_eq!(leased.len(), 1);
+    let message = &leased[0];
+
+    let wrong_owner_auth = auth_context(db.workspace_a, Uuid::now_v7());
+    let wrong_owner_err = db
+        .app_store
+        .mark_outbox_delivered(
+            &wrong_owner_auth,
+            message.id,
+            message.lease_token,
+            wrong_owner_auth.actor_id,
+            Utc::now(),
+        )
+        .await
+        .expect_err("wrong owner must fail");
     assert!(matches!(
-        failed_err,
-        StoreError::OutboxUpdateNotSingleRow { .. }
+        wrong_owner_err,
+        StoreError::OutboxLeaseOwnerMismatch { .. }
+    ));
+
+    let wrong_token_err = db
+        .app_store
+        .mark_outbox_delivered(
+            &auth,
+            message.id,
+            Uuid::now_v7(),
+            message.lease_owner,
+            Utc::now(),
+        )
+        .await
+        .expect_err("wrong token must fail");
+    assert!(matches!(
+        wrong_token_err,
+        StoreError::OutboxLeaseTokenMismatch { .. }
+    ));
+
+    let expired_err = db
+        .app_store
+        .mark_outbox_delivered(
+            &auth,
+            message.id,
+            message.lease_token,
+            message.lease_owner,
+            message.leased_until + Duration::seconds(1),
+        )
+        .await
+        .expect_err("expired lease must fail");
+    assert!(matches!(expired_err, StoreError::OutboxLeaseExpired { .. }));
+
+    db.app_store
+        .mark_outbox_delivered(
+            &auth,
+            message.id,
+            message.lease_token,
+            message.lease_owner,
+            Utc::now(),
+        )
+        .await
+        .expect("valid delivery transition");
+
+    let stale_duplicate_err = db
+        .app_store
+        .mark_outbox_delivered(
+            &auth,
+            message.id,
+            message.lease_token,
+            message.lease_owner,
+            Utc::now(),
+        )
+        .await
+        .expect_err("stale duplicate delivery must fail");
+    assert!(matches!(
+        stale_duplicate_err,
+        StoreError::OutboxNotLeased { .. }
     ));
 }

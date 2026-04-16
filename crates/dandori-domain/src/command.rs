@@ -6,6 +6,11 @@ use crate::{
     PreconditionError, ProjectId, ValidationError, WorkspaceId,
 };
 
+const MAX_NAME_LENGTH: usize = 200;
+const MAX_IDEMPOTENCY_KEY_LENGTH: usize = 128;
+const MAX_REQUEST_FINGERPRINT_LENGTH: usize = 128;
+const MAX_ISSUE_DESCRIPTION_LENGTH: usize = 4000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum IssueCommandV1 {
@@ -52,7 +57,7 @@ impl CreateWorkspaceCommandV1 {
                 message: "workspace name must not be empty".to_owned(),
             }));
         }
-        if self.name.len() > 200 {
+        if self.name.len() > MAX_NAME_LENGTH {
             return Err(DomainError::Validation(ValidationError {
                 code: "workspace_name_too_long",
                 message: "workspace name exceeds 200 characters".to_owned(),
@@ -95,7 +100,7 @@ impl CreateProjectCommandV1 {
                 message: "project name must not be empty".to_owned(),
             }));
         }
-        if self.name.len() > 200 {
+        if self.name.len() > MAX_NAME_LENGTH {
             return Err(DomainError::Validation(ValidationError {
                 code: "project_name_too_long",
                 message: "project name exceeds 200 characters".to_owned(),
@@ -128,7 +133,7 @@ impl CreateIssueCommandV1 {
                 message: "issue title must not be empty".to_owned(),
             }));
         }
-        if self.title.len() > 200 {
+        if self.title.len() > MAX_NAME_LENGTH {
             return Err(DomainError::Validation(ValidationError {
                 code: "title_too_long",
                 message: "issue title exceeds 200 characters".to_owned(),
@@ -140,7 +145,7 @@ impl CreateIssueCommandV1 {
                 message: "idempotency key must not be empty".to_owned(),
             }));
         }
-        if self.idempotency_key.as_str().len() > 128 {
+        if self.idempotency_key.as_str().len() > MAX_IDEMPOTENCY_KEY_LENGTH {
             return Err(DomainError::Validation(ValidationError {
                 code: "idempotency_key_too_long",
                 message: "idempotency key exceeds 128 characters".to_owned(),
@@ -150,6 +155,22 @@ impl CreateIssueCommandV1 {
             return Err(DomainError::Validation(ValidationError {
                 code: "request_fingerprint_required",
                 message: "request fingerprint must not be empty".to_owned(),
+            }));
+        }
+        if self.request_fingerprint.len() > MAX_REQUEST_FINGERPRINT_LENGTH {
+            return Err(DomainError::Validation(ValidationError {
+                code: "request_fingerprint_too_long",
+                message: "request fingerprint exceeds 128 characters".to_owned(),
+            }));
+        }
+        if self
+            .description
+            .as_ref()
+            .is_some_and(|description| description.len() > MAX_ISSUE_DESCRIPTION_LENGTH)
+        {
+            return Err(DomainError::Validation(ValidationError {
+                code: "description_too_long",
+                message: "issue description exceeds 4000 characters".to_owned(),
             }));
         }
         Ok(())
@@ -170,5 +191,46 @@ impl CreateIssueCommandV1 {
             code: "project_not_found",
             message: format!("project '{}' not found in workspace", self.project_id),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_create_issue_command() -> CreateIssueCommandV1 {
+        CreateIssueCommandV1 {
+            command_id: CommandId(Uuid::now_v7()),
+            idempotency_key: IdempotencyKey("idem".to_owned()),
+            request_fingerprint: "v2:abc".to_owned(),
+            issue_id: IssueId(Uuid::now_v7()),
+            workspace_id: WorkspaceId(Uuid::now_v7()),
+            project_id: ProjectId(Uuid::now_v7()),
+            milestone_id: None,
+            title: "title".to_owned(),
+            description: Some("description".to_owned()),
+            priority: IssuePriority::Medium,
+            actor_id: Uuid::now_v7(),
+        }
+    }
+
+    #[test]
+    fn create_issue_rejects_oversized_description() {
+        let mut command = base_create_issue_command();
+        command.description = Some("x".repeat(MAX_ISSUE_DESCRIPTION_LENGTH + 1));
+        let error = command
+            .validate()
+            .expect_err("oversized description must fail validation");
+        assert!(matches!(error, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn create_issue_rejects_oversized_request_fingerprint() {
+        let mut command = base_create_issue_command();
+        command.request_fingerprint = "x".repeat(MAX_REQUEST_FINGERPRINT_LENGTH + 1);
+        let error = command
+            .validate()
+            .expect_err("oversized fingerprint must fail validation");
+        assert!(matches!(error, DomainError::Validation(_)));
     }
 }

@@ -5,6 +5,6 @@ mod repositories;
 
 pub use migration::migrate_database;
 pub use pg_store::{
-    CreateIssueWriteResult, OutboxMessage, PgStore, ProjectWriteInput, StoreError,
-    WorkspaceWriteInput,
+    CreateIssueWriteResult, OutboxFailureContext, OutboxMessage, PgStore, ProjectWriteInput,
+    StoreError, WorkspaceWriteInput,
 };

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use dandori_domain::{AuthContext, IssueCreatedEventV1};
-use dandori_store::{OutboxMessage, PgStore, migrate_database};
+use dandori_store::{OutboxFailureContext, OutboxMessage, PgStore, migrate_database};
 use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -12,8 +12,10 @@ use crate::{AppServiceError, ErrorKind};
 
 #[derive(Debug, Clone)]
 pub struct OutboxWorkerConfig {
-    pub workspace_id: Uuid,
-    pub actor_id: Uuid,
+    pub workspace_ids: Vec<Uuid>,
+    pub shard_index: u16,
+    pub shard_total: u16,
+    pub worker_instance_id: Uuid,
     pub batch_size: i64,
     pub lease_seconds: i64,
     pub max_attempts: i32,
@@ -26,8 +28,10 @@ pub struct OutboxWorkerConfig {
 impl Default for OutboxWorkerConfig {
     fn default() -> Self {
         Self {
-            workspace_id: Uuid::nil(),
-            actor_id: Uuid::nil(),
+            workspace_ids: Vec::new(),
+            shard_index: 0,
+            shard_total: 1,
+            worker_instance_id: Uuid::nil(),
             batch_size: 32,
             lease_seconds: 30,
             max_attempts: 5,
@@ -186,96 +190,109 @@ impl OutboxWorkerService {
     }
 
     pub async fn run_once(&self) -> Result<WorkerRunReport, AppServiceError> {
-        let auth = AuthContext {
-            workspace_id: self.config.workspace_id.into(),
-            actor_id: self.config.actor_id,
-        };
+        let mut report = WorkerRunReport::default();
 
-        let now = Utc::now();
-        let leased = self
-            .store
-            .lease_outbox_batch(
-                &auth,
-                now,
-                Duration::seconds(self.config.lease_seconds),
-                self.config.batch_size,
-            )
-            .await
-            .map_err(map_store_worker_error)?;
-
-        info!(
-            workspace_id = %auth.workspace_id,
-            leased = leased.len(),
-            "worker leased outbox rows"
-        );
-
-        let mut report = WorkerRunReport {
-            leased: leased.len(),
-            ..WorkerRunReport::default()
-        };
-
-        for message in leased {
-            let previous_attempts = message.attempts;
-            match self.route_and_publish(&message).await {
-                Ok(()) => {
-                    self.store
-                        .mark_outbox_delivered(&auth, message.id, Utc::now())
-                        .await
-                        .map_err(map_store_worker_error)?;
-                    report.delivered += 1;
-                    info!(
-                        outbox_id = %message.id,
-                        event_type = %message.event_type,
-                        "outbox message delivered"
-                    );
-                }
-                Err(error) => {
-                    self.store
-                        .mark_outbox_failed(
-                            &auth,
-                            message.id,
-                            Utc::now(),
-                            format!("{:?}: {}", error.kind, error.message).as_str(),
-                            self.config.max_attempts,
-                            Duration::seconds(self.config.retry_backoff_seconds),
-                        )
-                        .await
-                        .map_err(map_store_worker_error)?;
-
-                    report.failed += 1;
-                    if previous_attempts + 1 >= self.config.max_attempts {
-                        report.dead_lettered += 1;
-                    }
-                    warn!(
-                        outbox_id = %message.id,
-                        event_type = %message.event_type,
-                        previous_attempts,
-                        failure_kind = ?error.kind,
-                        failure = %error.message,
-                        "outbox publish failed"
-                    );
-                }
-            }
+        let assigned_workspaces = self.assigned_workspace_ids();
+        if assigned_workspaces.is_empty() {
+            warn!("worker has no assigned workspaces for this shard");
+            return Ok(report);
         }
 
-        report.cleaned_outbox_rows = self
-            .store
-            .cleanup_outbox(
-                &auth,
-                Utc::now() - Duration::hours(self.config.delivered_retention_hours),
-                Utc::now() - Duration::hours(self.config.dead_letter_retention_hours),
-            )
-            .await
-            .map_err(map_store_worker_error)?;
+        for workspace_id in assigned_workspaces {
+            let auth = AuthContext {
+                workspace_id: workspace_id.into(),
+                actor_id: self.config.worker_instance_id,
+            };
 
-        report.cleaned_idempotency_rows = self
-            .store
-            .cleanup_idempotency(
-                &auth,
-                Utc::now() - Duration::hours(self.config.idempotency_retention_hours),
-            )
-            .await
-            .map_err(map_store_worker_error)?;
+            let now = Utc::now();
+            let leased = self
+                .store
+                .lease_outbox_batch(
+                    &auth,
+                    now,
+                    Duration::seconds(self.config.lease_seconds),
+                    self.config.batch_size,
+                )
+                .await
+                .map_err(map_store_worker_error)?;
+
+            info!(
+                workspace_id = %auth.workspace_id,
+                leased = leased.len(),
+                "worker leased outbox rows"
+            );
+            report.leased += leased.len();
+
+            for message in leased {
+                let previous_attempts = message.attempts;
+                match self.route_and_publish(&message).await {
+                    Ok(()) => {
+                        self.store
+                            .mark_outbox_delivered(
+                                &auth,
+                                message.id,
+                                message.lease_token,
+                                message.lease_owner,
+                                Utc::now(),
+                            )
+                            .await
+                            .map_err(map_store_worker_error)?;
+                        report.delivered += 1;
+                        info!(
+                            outbox_id = %message.id,
+                            event_type = %message.event_type,
+                            "outbox message delivered"
+                        );
+                    }
+                    Err(error) => {
+                        let failure = OutboxFailureContext {
+                            lease_token: message.lease_token,
+                            lease_owner: message.lease_owner,
+                            now: Utc::now(),
+                            error_message: format!("{:?}: {}", error.kind, error.message),
+                            max_attempts: self.config.max_attempts,
+                            retry_backoff: Duration::seconds(self.config.retry_backoff_seconds),
+                        };
+                        self.store
+                            .mark_outbox_failed(&auth, message.id, failure)
+                            .await
+                            .map_err(map_store_worker_error)?;
+
+                        report.failed += 1;
+                        if previous_attempts + 1 >= self.config.max_attempts {
+                            report.dead_lettered += 1;
+                        }
+                        warn!(
+                            outbox_id = %message.id,
+                            event_type = %message.event_type,
+                            previous_attempts,
+                            failure_kind = ?error.kind,
+                            failure = %error.message,
+                            "outbox publish failed"
+                        );
+                    }
+                }
+            }
+
+            report.cleaned_outbox_rows += self
+                .store
+                .cleanup_outbox(
+                    &auth,
+                    Utc::now() - Duration::hours(self.config.delivered_retention_hours),
+                    Utc::now() - Duration::hours(self.config.dead_letter_retention_hours),
+                )
+                .await
+                .map_err(map_store_worker_error)?;
+
+            report.cleaned_idempotency_rows += self
+                .store
+                .cleanup_idempotency(
+                    &auth,
+                    Utc::now() - Duration::hours(self.config.idempotency_retention_hours),
+                )
+                .await
+                .map_err(map_store_worker_error)?;
+        }
 
         info!(
             leased = report.leased,
@@ -288,6 +305,19 @@ impl OutboxWorkerService {
         );
 
         Ok(report)
+    }
+
+    fn assigned_workspace_ids(&self) -> Vec<Uuid> {
+        let shard_total = self.config.shard_total.max(1);
+        self.config
+            .workspace_ids
+            .iter()
+            .copied()
+            .filter(|workspace_id| {
+                (workspace_id.as_u128() % u128::from(shard_total))
+                    == u128::from(self.config.shard_index)
+            })
+            .collect()
     }
 
     async fn route_and_publish(&self, message: &OutboxMessage) -> Result<(), PublishError> {

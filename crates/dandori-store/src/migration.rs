@@ -10,7 +10,7 @@ CREATE TYPE outbox_status AS ENUM ('pending', 'leased', 'delivered', 'failed', '
 
 CREATE TABLE workspace (
     id uuid PRIMARY KEY,
-    name text NOT NULL,
+    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 200),
     row_version bigint NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
@@ -19,9 +19,9 @@ CREATE TABLE workspace (
 CREATE TABLE workflow_version (
     id uuid PRIMARY KEY,
     workspace_id uuid NOT NULL REFERENCES workspace(id),
-    name text NOT NULL,
+    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 200),
     version integer NOT NULL,
-    checksum text NOT NULL,
+    checksum text NOT NULL CHECK (char_length(checksum) BETWEEN 1 AND 128),
     states jsonb NOT NULL DEFAULT '[]'::jsonb,
     transitions jsonb NOT NULL DEFAULT '[]'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -32,7 +32,7 @@ CREATE TABLE workflow_version (
 CREATE TABLE project (
     id uuid PRIMARY KEY,
     workspace_id uuid NOT NULL REFERENCES workspace(id),
-    name text NOT NULL,
+    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 200),
     workflow_version_id uuid NOT NULL,
     row_version bigint NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -46,7 +46,7 @@ CREATE TABLE milestone (
     id uuid PRIMARY KEY,
     workspace_id uuid NOT NULL REFERENCES workspace(id),
     project_id uuid NOT NULL,
-    title text NOT NULL,
+    title text NOT NULL CHECK (char_length(title) BETWEEN 1 AND 200),
     due_at timestamptz,
     row_version bigint NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -61,8 +61,8 @@ CREATE TABLE issue (
     workspace_id uuid NOT NULL REFERENCES workspace(id),
     project_id uuid NOT NULL,
     milestone_id uuid,
-    title text NOT NULL,
-    description text,
+    title text NOT NULL CHECK (char_length(title) BETWEEN 1 AND 200),
+    description text CHECK (description IS NULL OR char_length(description) <= 4000),
     state_category issue_state_category NOT NULL,
     priority issue_priority NOT NULL,
     archived_at timestamptz,
@@ -96,7 +96,7 @@ CREATE TABLE activity (
     issue_id uuid,
     command_id uuid NOT NULL,
     actor_id uuid NOT NULL,
-    event_type text NOT NULL,
+    event_type text NOT NULL CHECK (char_length(event_type) BETWEEN 1 AND 128),
     event_payload jsonb NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
     FOREIGN KEY (workspace_id, project_id)
@@ -109,8 +109,8 @@ CREATE TABLE outbox (
     id uuid PRIMARY KEY,
     workspace_id uuid NOT NULL REFERENCES workspace(id),
     event_id uuid NOT NULL UNIQUE,
-    event_type text NOT NULL,
-    aggregate_type text NOT NULL,
+    event_type text NOT NULL CHECK (char_length(event_type) BETWEEN 1 AND 128),
+    aggregate_type text NOT NULL CHECK (char_length(aggregate_type) BETWEEN 1 AND 64),
     aggregate_id uuid NOT NULL,
     occurred_at timestamptz NOT NULL,
     correlation_id uuid NOT NULL,
@@ -120,17 +120,19 @@ CREATE TABLE outbox (
     status outbox_status NOT NULL DEFAULT 'pending',
     leased_at timestamptz,
     leased_until timestamptz,
+    lease_token uuid,
+    lease_owner uuid,
     published_at timestamptz,
-    last_error text,
+    last_error text CHECK (last_error IS NULL OR char_length(last_error) <= 4000),
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE idempotency_record (
     workspace_id uuid NOT NULL REFERENCES workspace(id),
-    command_name text NOT NULL,
-    idempotency_key text NOT NULL,
-    request_fingerprint text NOT NULL,
+    command_name text NOT NULL CHECK (char_length(command_name) BETWEEN 1 AND 128),
+    idempotency_key text NOT NULL CHECK (char_length(idempotency_key) BETWEEN 1 AND 128),
+    request_fingerprint text NOT NULL CHECK (char_length(request_fingerprint) BETWEEN 1 AND 128),
     response_payload jsonb NOT NULL,
     expires_at timestamptz NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -151,11 +153,11 @@ CREATE INDEX idx_issue_workspace_id_id ON issue(workspace_id, id);
 CREATE INDEX idx_issue_workspace_project ON issue(workspace_id, project_id, archived_at);
 CREATE INDEX idx_issue_workspace_project_state ON issue(workspace_id, project_id, state_category);
 CREATE INDEX idx_activity_workspace_created ON activity(workspace_id, created_at DESC);
-CREATE INDEX idx_outbox_poll_pending ON outbox(status, available_at, id)
+CREATE INDEX idx_outbox_poll_pending ON outbox(workspace_id, available_at, id)
     WHERE status IN ('pending', 'failed');
-CREATE INDEX idx_outbox_lease_expiry ON outbox(status, leased_until)
+CREATE INDEX idx_outbox_lease_expiry ON outbox(workspace_id, leased_until, id)
     WHERE status = 'leased';
-CREATE INDEX idx_outbox_retention ON outbox(status, published_at, updated_at);
+CREATE INDEX idx_outbox_retention ON outbox(workspace_id, status, published_at, updated_at);
 CREATE INDEX idx_idempotency_expires_at ON idempotency_record(expires_at);
 CREATE INDEX idx_idempotency_fingerprint ON idempotency_record(
     workspace_id,

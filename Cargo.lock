@@ -436,6 +436,7 @@ dependencies = [
  "secrecy",
  "serde_json",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "uuid",
 ]
@@ -449,8 +450,11 @@ dependencies = [
  "dandori-contract",
  "dandori-domain",
  "dandori-store",
+ "hex",
  "reqwest",
+ "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "testcontainers",
  "testcontainers-modules",
@@ -471,6 +475,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -532,6 +538,7 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "uuid",
 ]

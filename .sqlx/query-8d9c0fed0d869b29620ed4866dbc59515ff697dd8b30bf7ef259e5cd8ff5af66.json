@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n               status::text as \"status!\",\n               attempts,\n               lease_token,\n               lease_owner,\n               leased_until\n           FROM outbox\n           WHERE workspace_id = $1 AND id = $2\n           FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "attempts",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "lease_token",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "lease_owner",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "leased_until",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "8d9c0fed0d869b29620ed4866dbc59515ff697dd8b30bf7ef259e5cd8ff5af66"
+}

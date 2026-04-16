@@ -311,13 +311,25 @@ async fn rest_and_mcp_wire_paths_have_parity_for_malformed_and_auth_errors() {
         .and_then(|value| value.get("code"))
         .and_then(Value::as_str)
         .expect("rest unauthorized code");
+    let rest_unauthorized_message = rest_unauthorized_envelope
+        .get("error")
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .expect("rest unauthorized message");
     let mcp_unauthorized_code = mcp_unauthorized_envelope
         .get("error")
         .and_then(|value| value.get("code"))
         .and_then(Value::as_str)
         .expect("mcp unauthorized code");
+    let mcp_unauthorized_message = mcp_unauthorized_envelope
+        .get("error")
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .expect("mcp unauthorized message");
     assert_eq!(rest_unauthorized_code, "unauthorized");
     assert_eq!(mcp_unauthorized_code, "unauthorized");
+    assert_eq!(rest_unauthorized_message, "authentication failed");
+    assert_eq!(mcp_unauthorized_message, "authentication failed");
 
     mcp.shutdown().await;
     rest_server.abort();

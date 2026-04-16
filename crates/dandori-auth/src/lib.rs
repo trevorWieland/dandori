@@ -1,14 +1,24 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+mod algorithms;
 
 use jsonwebtoken::{
     Algorithm, DecodingKey, TokenData, Validation, decode, decode_header,
-    jwk::{Jwk, JwkSet, KeyAlgorithm},
+    jwk::{Jwk, JwkSet},
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use thiserror::Error;
+use tracing::{info, warn};
 use uuid::Uuid;
+
+use crate::algorithms::{
+    default_runtime_allowed_algorithms, default_test_allowed_algorithms, map_key_algorithm,
+    parse_allowed_algorithms,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedClaims {
@@ -22,6 +32,38 @@ pub struct OidcConfig {
     pub audience: String,
     pub jwks_source: JwksSource,
     pub allowed_algorithms: Vec<Algorithm>,
+    pub jwks_refresh: JwksRefreshConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JwksRefreshConfig {
+    pub interval_millis: u64,
+    pub timeout_millis: u64,
+    pub max_backoff_millis: u64,
+}
+
+impl Default for JwksRefreshConfig {
+    fn default() -> Self {
+        Self {
+            interval_millis: 300_000,
+            timeout_millis: 2_000,
+            max_backoff_millis: 300_000,
+        }
+    }
+}
+
+impl JwksRefreshConfig {
+    fn interval(&self) -> Duration {
+        Duration::from_millis(self.interval_millis.max(1))
+    }
+
+    fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_millis.max(1))
+    }
+
+    fn max_backoff(&self) -> Duration {
+        Duration::from_millis(self.max_backoff_millis.max(self.interval_millis.max(1)))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,8 +77,7 @@ pub struct JwtAuthenticator {
     issuer: String,
     audience: String,
     allowed_algorithms: Vec<Algorithm>,
-    keys: HashMap<String, JwkEntry>,
-    fallback_key: Option<JwkEntry>,
+    keyset: Arc<RwLock<JwkKeyset>>,
 }
 
 #[derive(Clone)]
@@ -45,12 +86,20 @@ struct JwkEntry {
     algorithm: Option<Algorithm>,
 }
 
+#[derive(Clone, Default)]
+struct JwkKeyset {
+    keys: HashMap<String, JwkEntry>,
+    fallback_key: Option<JwkEntry>,
+}
+
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("missing required environment variable '{0}'")]
     MissingEnv(&'static str),
     #[error("exactly one of DANDORI_OIDC_JWKS_PATH or DANDORI_OIDC_JWKS_URL must be configured")]
     InvalidJwksSource,
+    #[error("failed to parse environment variable '{name}' as a positive integer")]
+    InvalidEnvNumber { name: &'static str },
     #[error("failed to read JWKS file '{path}': {source}")]
     ReadJwksPath {
         path: String,
@@ -95,38 +144,19 @@ impl JwtAuthenticator {
     }
 
     pub async fn from_config(config: OidcConfig) -> Result<Self, AuthError> {
-        let jwks_raw = match &config.jwks_source {
-            JwksSource::Path(path) => {
-                std::fs::read_to_string(path).map_err(|source| AuthError::ReadJwksPath {
-                    path: path.display().to_string(),
-                    source,
-                })?
-            }
-            JwksSource::Url(url) => reqwest::get(url)
-                .await
-                .map_err(|source| AuthError::FetchJwksUrl {
-                    url: url.clone(),
-                    source,
-                })?
-                .error_for_status()
-                .map_err(|source| AuthError::FetchJwksUrl {
-                    url: url.clone(),
-                    source,
-                })?
-                .text()
-                .await
-                .map_err(|source| AuthError::FetchJwksUrl {
-                    url: url.clone(),
-                    source,
-                })?,
+        let jwks_raw = load_jwks_raw(&config.jwks_source).await?;
+        let keyset = parse_jwks(&jwks_raw)?;
+
+        let authenticator = Self {
+            issuer: config.issuer,
+            audience: config.audience,
+            allowed_algorithms: config.allowed_algorithms,
+            keyset: Arc::new(RwLock::new(keyset)),
         };
 
-        Self::from_jwks_json_with_allowed_algorithms(
-            config.issuer,
-            config.audience,
-            &jwks_raw,
-            config.allowed_algorithms,
-        )
+        authenticator.start_refresh_task(config.jwks_source, config.jwks_refresh);
+
+        Ok(authenticator)
     }
 
     pub fn from_jwks_json(
@@ -148,33 +178,13 @@ impl JwtAuthenticator {
         jwks_raw: &str,
         allowed_algorithms: Vec<Algorithm>,
     ) -> Result<Self, AuthError> {
-        let jwk_set: JwkSet = serde_json::from_str(jwks_raw).map_err(AuthError::InvalidJwks)?;
-        if jwk_set.keys.is_empty() {
-            return Err(AuthError::EmptyJwks);
-        }
-
-        let mut keys = HashMap::new();
-        let mut fallback_key = None;
-
-        for jwk in &jwk_set.keys {
-            let entry = JwkEntry::try_from_jwk(jwk)?;
-            if let Some(key_id) = &jwk.common.key_id {
-                keys.insert(key_id.clone(), entry.clone());
-            } else if fallback_key.is_none() {
-                fallback_key = Some(entry.clone());
-            }
-        }
-
-        if keys.is_empty() && fallback_key.is_none() {
-            return Err(AuthError::EmptyJwks);
-        }
+        let keyset = parse_jwks(jwks_raw)?;
 
         Ok(Self {
             issuer,
             audience,
             allowed_algorithms,
-            keys,
-            fallback_key,
+            keyset: Arc::new(RwLock::new(keyset)),
         })
     }
 
@@ -183,16 +193,23 @@ impl JwtAuthenticator {
         token: &SecretString,
     ) -> Result<AuthenticatedClaims, AuthError> {
         let header = decode_header(token.expose_secret()).map_err(AuthError::TokenHeader)?;
+
+        let keyset = match self.keyset.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
         let selected_key = if let Some(kid) = header.kid {
-            self.keys
+            keyset
+                .keys
                 .get(&kid)
                 .cloned()
                 .ok_or(AuthError::UnknownKid(kid))?
-        } else if self.keys.len() <= 1 {
-            if let Some(entry) = self.keys.values().next() {
+        } else if keyset.keys.len() <= 1 {
+            if let Some(entry) = keyset.keys.values().next() {
                 entry.clone()
             } else {
-                self.fallback_key.clone().ok_or(AuthError::MissingKid)?
+                keyset.fallback_key.clone().ok_or(AuthError::MissingKid)?
             }
         } else {
             return Err(AuthError::MissingKid);
@@ -229,15 +246,64 @@ impl JwtAuthenticator {
             workspace_id,
         })
     }
+
+    fn start_refresh_task(&self, source: JwksSource, refresh: JwksRefreshConfig) {
+        let keyset = Arc::clone(&self.keyset);
+        tokio::spawn(async move {
+            let mut next_delay = refresh.interval();
+            loop {
+                tokio::time::sleep(next_delay).await;
+                let result = tokio::time::timeout(refresh.timeout(), load_jwks_raw(&source)).await;
+
+                let new_keyset = match result {
+                    Ok(Ok(raw)) => parse_jwks(&raw),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => {
+                        warn!(
+                            source = ?source,
+                            timeout_millis = refresh.timeout_millis,
+                            "jwks refresh timed out"
+                        );
+                        next_delay = next_delay.saturating_mul(2).min(refresh.max_backoff());
+                        continue;
+                    }
+                };
+
+                match new_keyset {
+                    Ok(parsed) => {
+                        let keys_count = parsed.keys.len();
+                        {
+                            let mut guard = match keyset.write() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            *guard = parsed;
+                        }
+                        info!(source = ?source, keys_count, "jwks refresh succeeded");
+                        next_delay = refresh.interval();
+                    }
+                    Err(error) => {
+                        warn!(source = ?source, error = %error, "jwks refresh failed");
+                        next_delay = next_delay.saturating_mul(2).min(refresh.max_backoff());
+                    }
+                }
+            }
+        });
+    }
 }
 
 impl std::fmt::Debug for JwtAuthenticator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys_count = match self.keyset.read() {
+            Ok(guard) => guard.keys.len(),
+            Err(poisoned) => poisoned.into_inner().keys.len(),
+        };
+
         f.debug_struct("JwtAuthenticator")
             .field("issuer", &self.issuer)
             .field("audience", &self.audience)
             .field("allowed_algorithms", &self.allowed_algorithms)
-            .field("keys_count", &self.keys.len())
+            .field("keys_count", &keys_count)
             .finish_non_exhaustive()
     }
 }
@@ -264,11 +330,27 @@ impl OidcConfig {
             .transpose()?
             .unwrap_or_else(default_runtime_allowed_algorithms);
 
+        let jwks_refresh = JwksRefreshConfig {
+            interval_millis: parse_env_u64(
+                "DANDORI_OIDC_JWKS_REFRESH_INTERVAL_MILLIS",
+                JwksRefreshConfig::default().interval_millis,
+            )?,
+            timeout_millis: parse_env_u64(
+                "DANDORI_OIDC_JWKS_REFRESH_TIMEOUT_MILLIS",
+                JwksRefreshConfig::default().timeout_millis,
+            )?,
+            max_backoff_millis: parse_env_u64(
+                "DANDORI_OIDC_JWKS_REFRESH_MAX_BACKOFF_MILLIS",
+                JwksRefreshConfig::default().max_backoff_millis,
+            )?,
+        };
+
         Ok(Self {
             issuer,
             audience,
             jwks_source,
             allowed_algorithms,
+            jwks_refresh,
         })
     }
 }
@@ -290,157 +372,67 @@ impl JwkEntry {
     }
 }
 
-fn map_key_algorithm(algorithm: &KeyAlgorithm) -> Result<Algorithm, AuthError> {
-    let mapped = match algorithm {
-        KeyAlgorithm::HS256 => Algorithm::HS256,
-        KeyAlgorithm::HS384 => Algorithm::HS384,
-        KeyAlgorithm::HS512 => Algorithm::HS512,
-        KeyAlgorithm::ES256 => Algorithm::ES256,
-        KeyAlgorithm::ES384 => Algorithm::ES384,
-        KeyAlgorithm::RS256 => Algorithm::RS256,
-        KeyAlgorithm::RS384 => Algorithm::RS384,
-        KeyAlgorithm::RS512 => Algorithm::RS512,
-        KeyAlgorithm::PS256 => Algorithm::PS256,
-        KeyAlgorithm::PS384 => Algorithm::PS384,
-        KeyAlgorithm::PS512 => Algorithm::PS512,
-        KeyAlgorithm::EdDSA => Algorithm::EdDSA,
-        _ => return Err(AuthError::AlgorithmMismatch),
+fn parse_env_u64(name: &'static str, default: u64) -> Result<u64, AuthError> {
+    let Some(raw) = std::env::var(name).ok() else {
+        return Ok(default);
     };
 
-    Ok(mapped)
+    raw.parse::<u64>()
+        .map_err(|_| AuthError::InvalidEnvNumber { name })
 }
 
-fn parse_allowed_algorithms(value: &str) -> Result<Vec<Algorithm>, AuthError> {
-    let mut parsed = Vec::new();
-    for raw in value.split(',') {
-        let item = raw.trim();
-        if item.is_empty() {
-            continue;
+async fn load_jwks_raw(source: &JwksSource) -> Result<String, AuthError> {
+    match source {
+        JwksSource::Path(path) => {
+            std::fs::read_to_string(path).map_err(|source| AuthError::ReadJwksPath {
+                path: path.display().to_string(),
+                source,
+            })
         }
-
-        let algorithm = match item {
-            "RS256" => Algorithm::RS256,
-            "RS384" => Algorithm::RS384,
-            "RS512" => Algorithm::RS512,
-            "PS256" => Algorithm::PS256,
-            "PS384" => Algorithm::PS384,
-            "PS512" => Algorithm::PS512,
-            "ES256" => Algorithm::ES256,
-            "ES384" => Algorithm::ES384,
-            "EdDSA" => Algorithm::EdDSA,
-            "HS256" => Algorithm::HS256,
-            "HS384" => Algorithm::HS384,
-            "HS512" => Algorithm::HS512,
-            _ => return Err(AuthError::AlgorithmMismatch),
-        };
-        parsed.push(algorithm);
+        JwksSource::Url(url) => reqwest::get(url)
+            .await
+            .map_err(|source| AuthError::FetchJwksUrl {
+                url: url.clone(),
+                source,
+            })?
+            .error_for_status()
+            .map_err(|source| AuthError::FetchJwksUrl {
+                url: url.clone(),
+                source,
+            })?
+            .text()
+            .await
+            .map_err(|source| AuthError::FetchJwksUrl {
+                url: url.clone(),
+                source,
+            }),
     }
-
-    if parsed.is_empty() {
-        return Err(AuthError::AlgorithmMismatch);
-    }
-    Ok(parsed)
 }
 
-fn default_runtime_allowed_algorithms() -> Vec<Algorithm> {
-    vec![
-        Algorithm::RS256,
-        Algorithm::RS384,
-        Algorithm::RS512,
-        Algorithm::PS256,
-        Algorithm::PS384,
-        Algorithm::PS512,
-        Algorithm::ES256,
-        Algorithm::ES384,
-        Algorithm::EdDSA,
-    ]
-}
+fn parse_jwks(jwks_raw: &str) -> Result<JwkKeyset, AuthError> {
+    let jwk_set: JwkSet = serde_json::from_str(jwks_raw).map_err(AuthError::InvalidJwks)?;
+    if jwk_set.keys.is_empty() {
+        return Err(AuthError::EmptyJwks);
+    }
 
-fn default_test_allowed_algorithms() -> Vec<Algorithm> {
-    vec![
-        Algorithm::HS256,
-        Algorithm::HS384,
-        Algorithm::HS512,
-        Algorithm::RS256,
-        Algorithm::RS384,
-        Algorithm::RS512,
-        Algorithm::PS256,
-        Algorithm::PS384,
-        Algorithm::PS512,
-        Algorithm::ES256,
-        Algorithm::ES384,
-        Algorithm::EdDSA,
-    ]
+    let mut keys = HashMap::new();
+    let mut fallback_key = None;
+
+    for jwk in &jwk_set.keys {
+        let entry = JwkEntry::try_from_jwk(jwk)?;
+        if let Some(key_id) = &jwk.common.key_id {
+            keys.insert(key_id.clone(), entry.clone());
+        } else if fallback_key.is_none() {
+            fallback_key = Some(entry.clone());
+        }
+    }
+
+    if keys.is_empty() && fallback_key.is_none() {
+        return Err(AuthError::EmptyJwks);
+    }
+
+    Ok(JwkKeyset { keys, fallback_key })
 }
 
 #[cfg(test)]
-mod tests {
-    use chrono::Utc;
-    use jsonwebtoken::{EncodingKey, Header, encode};
-
-    use super::*;
-
-    const TEST_JWKS: &str =
-        r#"{"keys":[{"kty":"oct","k":"c2VjcmV0","alg":"HS256","kid":"test-key"}]}"#;
-
-    #[derive(Debug, serde::Serialize)]
-    struct Claims {
-        sub: String,
-        workspace_id: String,
-        iss: String,
-        aud: String,
-        exp: usize,
-        nbf: usize,
-    }
-
-    fn build_token(issuer: &str, audience: &str, workspace_id: Uuid) -> SecretString {
-        let mut header = Header::new(Algorithm::HS256);
-        header.kid = Some("test-key".to_owned());
-
-        let now = Utc::now().timestamp() as usize;
-        let claims = Claims {
-            sub: Uuid::now_v7().to_string(),
-            workspace_id: workspace_id.to_string(),
-            iss: issuer.to_owned(),
-            aud: audience.to_owned(),
-            exp: now + 3600,
-            nbf: now.saturating_sub(30),
-        };
-
-        let token = encode(&header, &claims, &EncodingKey::from_secret(b"secret"))
-            .expect("encode test token");
-        SecretString::from(token)
-    }
-
-    #[test]
-    fn validates_claims_from_jwks() {
-        let issuer = "https://issuer.example".to_owned();
-        let audience = "dandori".to_owned();
-        let authenticator =
-            JwtAuthenticator::from_jwks_json(issuer.clone(), audience.clone(), TEST_JWKS)
-                .expect("authenticator");
-
-        let workspace_id = Uuid::now_v7();
-        let token = build_token(&issuer, &audience, workspace_id);
-        let claims = authenticator.authenticate_token(&token).expect("claims");
-
-        assert_eq!(claims.workspace_id, workspace_id);
-    }
-
-    #[test]
-    fn rejects_wrong_issuer() {
-        let authenticator = JwtAuthenticator::from_jwks_json(
-            "https://issuer.example".to_owned(),
-            "dandori".to_owned(),
-            TEST_JWKS,
-        )
-        .expect("authenticator");
-
-        let token = build_token("https://wrong.example", "dandori", Uuid::now_v7());
-        let error = authenticator
-            .authenticate_token(&token)
-            .expect_err("issuer mismatch should fail");
-
-        assert!(matches!(error, AuthError::TokenVerify(_)));
-    }
-}
+mod tests;

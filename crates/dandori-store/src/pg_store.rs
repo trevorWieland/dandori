@@ -48,6 +48,19 @@ pub struct OutboxMessage {
     pub correlation_id: Uuid,
     pub payload: Value,
     pub attempts: i32,
+    pub lease_token: Uuid,
+    pub lease_owner: Uuid,
+    pub leased_until: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutboxFailureContext {
+    pub lease_token: Uuid,
+    pub lease_owner: Uuid,
+    pub now: DateTime<Utc>,
+    pub error_message: String,
+    pub max_attempts: i32,
+    pub retry_backoff: Duration,
 }
 
 #[derive(Debug, Error)]
@@ -81,6 +94,43 @@ pub enum StoreError {
         workspace_id: Uuid,
         outbox_id: Uuid,
         rows_affected: u64,
+    },
+    #[error("outbox row '{outbox_id}' not found in workspace '{workspace_id}'")]
+    OutboxLeaseMissing { workspace_id: Uuid, outbox_id: Uuid },
+    #[error(
+        "outbox row '{outbox_id}' in workspace '{workspace_id}' is not leased (current status: {status})"
+    )]
+    OutboxNotLeased {
+        workspace_id: Uuid,
+        outbox_id: Uuid,
+        status: String,
+    },
+    #[error(
+        "outbox row '{outbox_id}' in workspace '{workspace_id}' lease expired at '{leased_until}' (now '{now}')"
+    )]
+    OutboxLeaseExpired {
+        workspace_id: Uuid,
+        outbox_id: Uuid,
+        leased_until: DateTime<Utc>,
+        now: DateTime<Utc>,
+    },
+    #[error(
+        "outbox row '{outbox_id}' in workspace '{workspace_id}' lease owner mismatch (expected '{expected_owner}', actual '{actual_owner}')"
+    )]
+    OutboxLeaseOwnerMismatch {
+        workspace_id: Uuid,
+        outbox_id: Uuid,
+        expected_owner: Uuid,
+        actual_owner: Uuid,
+    },
+    #[error(
+        "outbox row '{outbox_id}' in workspace '{workspace_id}' lease token mismatch (expected '{expected_token}', actual '{actual_token}')"
+    )]
+    OutboxLeaseTokenMismatch {
+        workspace_id: Uuid,
+        outbox_id: Uuid,
+        expected_token: Uuid,
+        actual_token: Uuid,
     },
     #[error("domain violation: {0}")]
     Domain(#[from] DomainError),
@@ -176,30 +226,20 @@ impl PgStore {
         &self,
         auth: &AuthContext,
         outbox_id: Uuid,
+        lease_token: Uuid,
+        lease_owner: Uuid,
         now: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        outbox::mark_outbox_delivered(self, auth, outbox_id, now).await
+        outbox::mark_outbox_delivered(self, auth, outbox_id, lease_token, lease_owner, now).await
     }
 
     pub async fn mark_outbox_failed(
         &self,
         auth: &AuthContext,
         outbox_id: Uuid,
-        now: DateTime<Utc>,
-        error_message: &str,
-        max_attempts: i32,
-        retry_backoff: Duration,
+        failure: OutboxFailureContext,
     ) -> Result<(), StoreError> {
-        outbox::mark_outbox_failed(
-            self,
-            auth,
-            outbox_id,
-            now,
-            error_message,
-            max_attempts,
-            retry_backoff,
-        )
-        .await
+        outbox::mark_outbox_failed(self, auth, outbox_id, &failure).await
     }
 
     pub async fn cleanup_outbox(

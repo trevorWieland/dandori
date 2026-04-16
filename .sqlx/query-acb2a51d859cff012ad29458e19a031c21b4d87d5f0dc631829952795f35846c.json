@@ -1,0 +1,93 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH candidates AS (\n            SELECT id\n            FROM outbox\n            WHERE workspace_id = $1\n              AND (\n                ((status = 'pending'::outbox_status OR status = 'failed'::outbox_status) AND available_at <= $2)\n                OR (status = 'leased'::outbox_status AND leased_until <= $2)\n              )\n            ORDER BY available_at, id\n            LIMIT $3\n            FOR UPDATE SKIP LOCKED\n        )\n        UPDATE outbox AS o\n        SET status = 'leased'::outbox_status,\n            leased_at = $2,\n            leased_until = $4,\n            lease_token = $5,\n            lease_owner = $6,\n            updated_at = $2\n        FROM candidates\n        WHERE o.id = candidates.id\n        RETURNING o.id,\n                  o.workspace_id,\n                  o.event_id,\n                  o.event_type,\n                  o.aggregate_type,\n                  o.aggregate_id,\n                  o.correlation_id,\n                  o.payload as \"payload!: serde_json::Value\",\n                  o.attempts,\n                  o.lease_token as \"lease_token!: Uuid\",\n                  o.lease_owner as \"lease_owner!: Uuid\",\n                  o.leased_until as \"leased_until!: DateTime<Utc>\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "event_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "event_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "aggregate_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "aggregate_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "correlation_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "payload!: serde_json::Value",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 8,
+        "name": "attempts",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "lease_token!: Uuid",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 10,
+        "name": "lease_owner!: Uuid",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 11,
+        "name": "leased_until!: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Int8",
+        "Timestamptz",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "acb2a51d859cff012ad29458e19a031c21b4d87d5f0dc631829952795f35846c"
+}

@@ -1,10 +1,7 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use dandori_app_services::{
-    OutboxPublisher, OutboxWorkerConfig, OutboxWorkerService, PublishError, PublishErrorKind,
-};
+use dandori_app_services::{OutboxWorkerConfig, OutboxWorkerService};
 use dandori_domain::{
     AuthContext, CommandId, CreateIssueCommandV1, IdempotencyKey, IssueCreatedEventV1, IssueId,
     IssuePriority,
@@ -15,60 +12,19 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
 
+#[path = "support/worker_publishers.rs"]
+mod worker_publishers;
+
+use worker_publishers::{AlwaysOkPublisher, PermanentFailurePublisher, TransientFailurePublisher};
+
 struct TestWorkerDb {
     _container: testcontainers::ContainerAsync<Postgres>,
     admin_pool: PgPool,
     store: PgStore,
     auth: AuthContext,
     project_id: Uuid,
-}
-
-#[derive(Debug)]
-struct AlwaysOkPublisher;
-
-#[async_trait]
-impl OutboxPublisher for AlwaysOkPublisher {
-    async fn publish_issue_created(
-        &self,
-        _message: &dandori_store::OutboxMessage,
-        _event: &IssueCreatedEventV1,
-    ) -> Result<(), PublishError> {
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct TransientFailurePublisher;
-
-#[async_trait]
-impl OutboxPublisher for TransientFailurePublisher {
-    async fn publish_issue_created(
-        &self,
-        _message: &dandori_store::OutboxMessage,
-        _event: &IssueCreatedEventV1,
-    ) -> Result<(), PublishError> {
-        Err(PublishError {
-            kind: PublishErrorKind::Transient,
-            message: "temporary downstream outage".to_owned(),
-        })
-    }
-}
-
-#[derive(Debug)]
-struct PermanentFailurePublisher;
-
-#[async_trait]
-impl OutboxPublisher for PermanentFailurePublisher {
-    async fn publish_issue_created(
-        &self,
-        _message: &dandori_store::OutboxMessage,
-        _event: &IssueCreatedEventV1,
-    ) -> Result<(), PublishError> {
-        Err(PublishError {
-            kind: PublishErrorKind::Permanent,
-            message: "permanent downstream rejection".to_owned(),
-        })
-    }
+    workspace_b: Uuid,
+    project_b: Uuid,
 }
 
 async fn setup() -> TestWorkerDb {
@@ -113,32 +69,46 @@ async fn setup() -> TestWorkerDb {
     .expect("grant table perms");
 
     let workspace_id = Uuid::now_v7();
+    let mut workspace_b = Uuid::now_v7();
+    while (workspace_id.as_u128() % 2) == (workspace_b.as_u128() % 2) {
+        workspace_b = Uuid::now_v7();
+    }
     let workflow_id = Uuid::now_v7();
+    let workflow_b = Uuid::now_v7();
     let project_id = Uuid::now_v7();
+    let project_b = Uuid::now_v7();
 
-    sqlx::query("INSERT INTO workspace (id, name) VALUES ($1, 'worker-ws')")
+    sqlx::query("INSERT INTO workspace (id, name) VALUES ($1, 'worker-ws-a'), ($2, 'worker-ws-b')")
         .bind(workspace_id)
+        .bind(workspace_b)
         .execute(&admin_pool)
         .await
         .expect("seed workspace");
 
     sqlx::query(
         "INSERT INTO workflow_version (id, workspace_id, name, version, checksum, states, transitions)
-         VALUES ($1, $2, 'default', 1, 'sha256:worker', '[]'::jsonb, '[]'::jsonb)",
+         VALUES ($1, $2, 'default', 1, 'sha256:worker-a', '[]'::jsonb, '[]'::jsonb),
+                ($3, $4, 'default', 1, 'sha256:worker-b', '[]'::jsonb, '[]'::jsonb)",
     )
     .bind(workflow_id)
     .bind(workspace_id)
+    .bind(workflow_b)
+    .bind(workspace_b)
     .execute(&admin_pool)
     .await
     .expect("seed workflow");
 
     sqlx::query(
         "INSERT INTO project (id, workspace_id, name, workflow_version_id)
-         VALUES ($1, $2, 'worker-project', $3)",
+         VALUES ($1, $2, 'worker-project-a', $3),
+                ($4, $5, 'worker-project-b', $6)",
     )
     .bind(project_id)
     .bind(workspace_id)
     .bind(workflow_id)
+    .bind(project_b)
+    .bind(workspace_b)
+    .bind(workflow_b)
     .execute(&admin_pool)
     .await
     .expect("seed project");
@@ -155,6 +125,8 @@ async fn setup() -> TestWorkerDb {
             actor_id: Uuid::now_v7(),
         },
         project_id,
+        workspace_b,
+        project_b,
     }
 }
 
@@ -207,8 +179,10 @@ async fn worker_delivers_known_issue_created_outbox_message() {
     let worker = OutboxWorkerService::new(
         db.store.clone(),
         OutboxWorkerConfig {
-            workspace_id: db.auth.workspace_id.0,
-            actor_id: db.auth.actor_id,
+            workspace_ids: vec![db.auth.workspace_id.0],
+            shard_index: 0,
+            shard_total: 1,
+            worker_instance_id: db.auth.actor_id,
             batch_size: 10,
             lease_seconds: 30,
             max_attempts: 3,
@@ -255,8 +229,10 @@ async fn worker_retries_and_dead_letters_unknown_event_type() {
     let worker = OutboxWorkerService::new(
         db.store.clone(),
         OutboxWorkerConfig {
-            workspace_id: db.auth.workspace_id.0,
-            actor_id: db.auth.actor_id,
+            workspace_ids: vec![db.auth.workspace_id.0],
+            shard_index: 0,
+            shard_total: 1,
+            worker_instance_id: db.auth.actor_id,
             batch_size: 10,
             lease_seconds: 30,
             max_attempts: 1,
@@ -306,8 +282,10 @@ async fn worker_marks_transient_publish_failures_as_failed_for_retry() {
     let worker = OutboxWorkerService::new(
         db.store.clone(),
         OutboxWorkerConfig {
-            workspace_id: db.auth.workspace_id.0,
-            actor_id: db.auth.actor_id,
+            workspace_ids: vec![db.auth.workspace_id.0],
+            shard_index: 0,
+            shard_total: 1,
+            worker_instance_id: db.auth.actor_id,
             batch_size: 10,
             lease_seconds: 30,
             max_attempts: 3,
@@ -346,8 +324,10 @@ async fn worker_marks_permanent_publish_failures_dead_letter_when_attempt_budget
     let worker = OutboxWorkerService::new(
         db.store.clone(),
         OutboxWorkerConfig {
-            workspace_id: db.auth.workspace_id.0,
-            actor_id: db.auth.actor_id,
+            workspace_ids: vec![db.auth.workspace_id.0],
+            shard_index: 0,
+            shard_total: 1,
+            worker_instance_id: db.auth.actor_id,
             batch_size: 10,
             lease_seconds: 30,
             max_attempts: 1,
@@ -370,4 +350,117 @@ async fn worker_marks_permanent_publish_failures_dead_letter_when_attempt_budget
         .await
         .expect("read outbox status");
     assert_eq!(status, "dead_letter");
+}
+
+#[tokio::test]
+async fn worker_processes_multiple_workspaces_in_one_run() {
+    let db = setup().await;
+    let auth_b = AuthContext {
+        workspace_id: db.workspace_b.into(),
+        actor_id: Uuid::now_v7(),
+    };
+
+    let command_a = make_command(&db.auth, db.project_id, "worker-multi-a");
+    let event_a = make_event(&command_a);
+    db.store
+        .create_issue_transactional(&db.auth, &command_a, &event_a)
+        .await
+        .expect("create issue in workspace a");
+
+    let command_b = make_command(&auth_b, db.project_b, "worker-multi-b");
+    let event_b = make_event(&command_b);
+    db.store
+        .create_issue_transactional(&auth_b, &command_b, &event_b)
+        .await
+        .expect("create issue in workspace b");
+
+    let worker = OutboxWorkerService::new(
+        db.store.clone(),
+        OutboxWorkerConfig {
+            workspace_ids: vec![db.auth.workspace_id.0, db.workspace_b],
+            shard_index: 0,
+            shard_total: 1,
+            worker_instance_id: db.auth.actor_id,
+            batch_size: 16,
+            lease_seconds: 30,
+            max_attempts: 3,
+            retry_backoff_seconds: 0,
+            delivered_retention_hours: 1_000,
+            dead_letter_retention_hours: 1_000,
+            idempotency_retention_hours: 1_000,
+        },
+        Arc::new(AlwaysOkPublisher),
+    );
+
+    let report = worker.run_once().await.expect("worker run");
+    assert_eq!(report.leased, 2);
+    assert_eq!(report.delivered, 2);
+}
+
+#[tokio::test]
+async fn workers_on_disjoint_shards_do_not_overlap_workspaces() {
+    let db = setup().await;
+    let auth_b = AuthContext {
+        workspace_id: db.workspace_b.into(),
+        actor_id: Uuid::now_v7(),
+    };
+
+    let command_a = make_command(&db.auth, db.project_id, "worker-shard-a");
+    let event_a = make_event(&command_a);
+    db.store
+        .create_issue_transactional(&db.auth, &command_a, &event_a)
+        .await
+        .expect("create issue in workspace a");
+
+    let command_b = make_command(&auth_b, db.project_b, "worker-shard-b");
+    let event_b = make_event(&command_b);
+    db.store
+        .create_issue_transactional(&auth_b, &command_b, &event_b)
+        .await
+        .expect("create issue in workspace b");
+
+    let workspace_ids = vec![db.auth.workspace_id.0, db.workspace_b];
+
+    let worker_shard_0 = OutboxWorkerService::new(
+        db.store.clone(),
+        OutboxWorkerConfig {
+            workspace_ids: workspace_ids.clone(),
+            shard_index: 0,
+            shard_total: 2,
+            worker_instance_id: Uuid::now_v7(),
+            batch_size: 16,
+            lease_seconds: 30,
+            max_attempts: 3,
+            retry_backoff_seconds: 0,
+            delivered_retention_hours: 1_000,
+            dead_letter_retention_hours: 1_000,
+            idempotency_retention_hours: 1_000,
+        },
+        Arc::new(AlwaysOkPublisher),
+    );
+
+    let worker_shard_1 = OutboxWorkerService::new(
+        db.store.clone(),
+        OutboxWorkerConfig {
+            workspace_ids,
+            shard_index: 1,
+            shard_total: 2,
+            worker_instance_id: Uuid::now_v7(),
+            batch_size: 16,
+            lease_seconds: 30,
+            max_attempts: 3,
+            retry_backoff_seconds: 0,
+            delivered_retention_hours: 1_000,
+            dead_letter_retention_hours: 1_000,
+            idempotency_retention_hours: 1_000,
+        },
+        Arc::new(AlwaysOkPublisher),
+    );
+
+    let report_0 = worker_shard_0.run_once().await.expect("worker shard 0 run");
+    let report_1 = worker_shard_1.run_once().await.expect("worker shard 1 run");
+
+    assert_eq!(report_0.delivered, 1);
+    assert_eq!(report_1.delivered, 1);
+    assert_eq!(report_0.delivered + report_1.delivered, 2);
 }

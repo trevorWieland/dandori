@@ -44,11 +44,16 @@ impl ApiState {
 
 impl ApiState {
     fn auth_context(&self, headers: &HeaderMap) -> Result<AuthContext, (StatusCode, String)> {
+        const UNAUTHORIZED_MESSAGE: &str = "authentication failed";
+
         let token = headers
             .get("authorization")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
-            .ok_or((StatusCode::UNAUTHORIZED, "missing bearer token".to_owned()))?;
+            .ok_or_else(|| {
+                tracing::warn!("request missing bearer token");
+                (StatusCode::UNAUTHORIZED, UNAUTHORIZED_MESSAGE.to_owned())
+            })?;
 
         let claims = self
             .jwt
@@ -63,7 +68,8 @@ impl ApiState {
 }
 
 fn map_auth_error(error: AuthError) -> (StatusCode, String) {
-    (StatusCode::UNAUTHORIZED, error.to_string())
+    tracing::warn!(error = ?error, "request authentication failed");
+    (StatusCode::UNAUTHORIZED, "authentication failed".to_owned())
 }
 
 pub fn build_router(state: ApiState) -> Router {

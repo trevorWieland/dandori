@@ -81,10 +81,11 @@ impl McpState {
                 actor_id: claims.actor_id,
             },
             Err(error) => {
+                tracing::warn!(error = ?error, "mcp authentication failed");
                 return Envelope::Err {
                     error: ErrorEnvelope {
                         code: "unauthorized".to_owned(),
-                        message: error.to_string(),
+                        message: "authentication failed".to_owned(),
                     },
                 };
             }

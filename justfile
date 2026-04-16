@@ -3,7 +3,7 @@ default:
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-cargo := env("CARGO", "cargo")
+cargo := "SQLX_OFFLINE=true " + env("CARGO", "cargo")
 max_lines := "500"
 toml_globs := "Cargo.toml bin/*/Cargo.toml crates/*/Cargo.toml .cargo/*.toml .config/*.toml rust-toolchain.toml clippy.toml taplo.toml deny.toml rustfmt.toml lefthook.yml"
 
@@ -107,7 +107,6 @@ check-sql-policy:
     offenders=$(
       rg -n 'sqlx::' crates/dandori-store/src \
         --glob '!crates/dandori-store/src/repositories/common.rs' \
-        --glob '!crates/dandori-store/src/repositories/issue.rs' \
         --glob '!crates/dandori-store/src/repositories/outbox.rs' \
         --glob '!crates/dandori-store/src/pg_store.rs' || true
     )
@@ -124,10 +123,11 @@ check-sqlx-offline:
       echo "FAIL: .sqlx metadata directory is missing"
       exit 1
     fi
-    if [[ -z "$(ls -A .sqlx 2>/dev/null)" ]]; then
-      echo "FAIL: .sqlx metadata directory is empty"
+    if ! find .sqlx -maxdepth 1 -name 'query-*.json' -print -quit | grep -q .; then
+      echo "FAIL: .sqlx metadata must include query-*.json files"
       exit 1
     fi
+    SQLX_OFFLINE=true {{ cargo }} check -p dandori-store --all-targets
 
 check-no-leaks:
     #!/usr/bin/env bash

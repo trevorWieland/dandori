@@ -1,11 +1,12 @@
+use anyhow::Context;
 use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let database_url = std::env::var("DANDORI_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/postgres".to_owned());
+    let database_url =
+        std::env::var("DANDORI_DATABASE_URL").context("DANDORI_DATABASE_URL is required")?;
     let bind = std::env::var("DANDORI_API_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_owned());
     let run_migrations = std::env::var("DANDORI_RUN_MIGRATIONS")
         .ok()

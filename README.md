@@ -47,6 +47,10 @@ Required environment variables:
   - `DANDORI_OIDC_JWKS_URL`
 - optional strict algorithm allowlist:
   - `DANDORI_OIDC_ALLOWED_ALGS` (comma-separated, e.g. `RS256,ES256,EdDSA`)
+- optional JWKS rotation tuning:
+  - `DANDORI_OIDC_JWKS_REFRESH_INTERVAL_MILLIS`
+  - `DANDORI_OIDC_JWKS_REFRESH_TIMEOUT_MILLIS`
+  - `DANDORI_OIDC_JWKS_REFRESH_MAX_BACKOFF_MILLIS`
 
 No fallback dev secrets are enabled.
 
@@ -55,6 +59,7 @@ No fallback dev secrets are enabled.
 - API, MCP, and worker binaries default to `run_migrations = false`.
 - To explicitly allow startup migrations for controlled local workflows, set:
   - `DANDORI_RUN_MIGRATIONS=true`
+- API/MCP/worker/migrate all require `DANDORI_DATABASE_URL` explicitly.
 
 ## MCP Runtime
 
@@ -79,6 +84,11 @@ The worker supports a concrete HTTP publisher adapter.
 - `DANDORI_OUTBOX_PUBLISH_URL` (optional)
   - when set: worker publishes `issue.created.v1` envelopes to this URL
   - when unset: worker uses a no-op publisher for local/dev flows
+- Worker shard config:
+  - `DANDORI_WORKER_WORKSPACE_IDS` (required, comma-separated UUIDs)
+  - `DANDORI_WORKER_SHARD_INDEX` (optional, default `0`)
+  - `DANDORI_WORKER_SHARD_TOTAL` (optional, default `1`)
+  - `DANDORI_WORKER_INSTANCE_ID` (optional UUID, defaults to generated value)
 
 ## Workspace Layout
 

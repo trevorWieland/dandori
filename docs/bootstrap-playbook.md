@@ -35,6 +35,16 @@
   - `DANDORI_OIDC_AUDIENCE`
   - one JWKS source (`DANDORI_OIDC_JWKS_PATH` or `DANDORI_OIDC_JWKS_URL`)
   - optional algorithm allowlist (`DANDORI_OIDC_ALLOWED_ALGS`, comma-separated)
+  - optional JWKS refresh tuning:
+    - `DANDORI_OIDC_JWKS_REFRESH_INTERVAL_MILLIS`
+    - `DANDORI_OIDC_JWKS_REFRESH_TIMEOUT_MILLIS`
+    - `DANDORI_OIDC_JWKS_REFRESH_MAX_BACKOFF_MILLIS`
+- Runtime binaries (`dandori-api`, `dandori-mcp`, `dandori-worker`, `dandori-migrate`) require `DANDORI_DATABASE_URL` explicitly.
+- Worker shard topology env:
+  - `DANDORI_WORKER_WORKSPACE_IDS` (comma-separated UUIDs)
+  - `DANDORI_WORKER_SHARD_INDEX`
+  - `DANDORI_WORKER_SHARD_TOTAL`
+  - `DANDORI_WORKER_INSTANCE_ID`
 - Runtime migration policy defaults to disabled:
   - set `DANDORI_RUN_MIGRATIONS=true` only for intentional local startup-migration workflows
 
