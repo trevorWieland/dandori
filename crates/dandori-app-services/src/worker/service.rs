@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
-use dandori_domain::{AuthContext, EventType, IssueCreatedEventV1};
+use dandori_domain::AuthContext;
 use dandori_store::{
     OutboxFailureClassification, OutboxFailureContext, OutboxMessage, PgStore, migrate_database,
 };
@@ -12,10 +12,11 @@ use uuid::Uuid;
 
 use super::config::{OutboxWorkerConfig, WorkerRunReport};
 use super::publish::{
-    HttpOutboxPublisher, NoopOutboxPublisher, OutboxPublisher, PublishError, PublishErrorKind,
+    HttpOutboxPublisher, NoopOutboxPublisher, OutboxPublisher, PublishError,
     retry_backoff_with_jitter,
 };
-use crate::{AppServiceError, ErrorKind};
+use super::registry::{OutboxRegistry, handlers};
+use crate::AppServiceError;
 
 /// Top-level worker service. Holds the store, publisher, and config; callers
 /// drive one cycle at a time via [`run_once`](Self::run_once).
@@ -24,6 +25,7 @@ pub struct OutboxWorkerService {
     store: PgStore,
     config: OutboxWorkerConfig,
     publisher: Arc<dyn OutboxPublisher>,
+    registry: Arc<OutboxRegistry>,
     partition_state: Arc<Mutex<PartitionState>>,
 }
 
@@ -31,6 +33,8 @@ pub struct OutboxWorkerService {
 struct PartitionState {
     leased: Vec<Uuid>,
 }
+
+type TenantOutcome = (Uuid, Result<WorkerRunReport, AppServiceError>);
 
 impl std::fmt::Debug for OutboxWorkerService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -54,12 +58,32 @@ impl OutboxWorkerService {
         config: OutboxWorkerConfig,
         publisher: Arc<dyn OutboxPublisher>,
     ) -> Self {
+        Self::with_registry(store, config, publisher, Arc::new(Self::default_registry()))
+    }
+
+    #[must_use]
+    pub fn with_registry(
+        store: PgStore,
+        config: OutboxWorkerConfig,
+        publisher: Arc<dyn OutboxPublisher>,
+        registry: Arc<OutboxRegistry>,
+    ) -> Self {
         Self {
             store,
             config,
             publisher,
+            registry,
             partition_state: Arc::new(Mutex::new(PartitionState::default())),
         }
+    }
+
+    /// The default registry wires the Phase-1 event handlers. New events
+    /// are added by registering additional `OutboxHandler` implementations
+    /// here rather than by growing the publisher trait.
+    pub fn default_registry() -> OutboxRegistry {
+        let mut registry = OutboxRegistry::new();
+        registry.register(Arc::new(handlers::IssueCreatedV1Handler));
+        registry
     }
 
     /// Wire the service with a publisher chosen from environment variables.
@@ -97,11 +121,7 @@ impl OutboxWorkerService {
         let publisher: Arc<dyn OutboxPublisher> = match (publish_url, allow_noop) {
             (Some(endpoint), _) => Arc::new(
                 HttpOutboxPublisher::new(endpoint.to_owned(), &config).map_err(|error| {
-                    AppServiceError {
-                        code: "publisher_init_failed",
-                        message: error.message,
-                        kind: ErrorKind::Infrastructure,
-                    }
+                    AppServiceError::internal("publisher_init_failed", error.message)
                 })?,
             ),
             (None, true) => {
@@ -111,13 +131,12 @@ impl OutboxWorkerService {
                 Arc::new(NoopOutboxPublisher)
             }
             (None, false) => {
-                return Err(AppServiceError {
-                    code: "publisher_not_configured",
-                    message: format!(
+                return Err(AppServiceError::internal(
+                    "publisher_not_configured",
+                    format!(
                         "{PUBLISH_URL_ENV} is required unless {NOOP_PUBLISHER_ENV}=1 is set (dev only)"
                     ),
-                    kind: ErrorKind::Infrastructure,
-                });
+                ));
             }
         };
 
@@ -131,51 +150,44 @@ impl OutboxWorkerService {
             return Ok(report);
         }
 
-        for workspace_id in assigned {
-            let auth = AuthContext {
-                workspace_id: workspace_id.into(),
-                actor_id: self.config.worker_instance_id,
-            };
+        let concurrency = self.config.tenant_max_concurrency.clamp(1, 256);
+        let this = self.clone();
 
-            let now = Utc::now();
-            let leased = self
-                .store
-                .lease_outbox_batch(
-                    &auth,
-                    now,
-                    Duration::seconds(self.config.lease_seconds),
-                    self.config.batch_size,
-                )
-                .await
-                .map_err(map_store_worker_error)?;
+        let per_tenant: Vec<TenantOutcome> = futures::stream::iter(assigned.clone())
+            .map(move |workspace_id| {
+                let this = this.clone();
+                async move {
+                    let auth = AuthContext {
+                        workspace_id: workspace_id.into(),
+                        actor_id: this.config.worker_instance_id,
+                    };
+                    let outcome = this.run_tenant_cycle(&auth).await;
+                    (workspace_id, outcome)
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
 
-            info!(
-                workspace_id = %auth.workspace_id,
-                leased = leased.len(),
-                "worker leased outbox rows"
-            );
-            report.leased += leased.len();
-
-            self.process_leased(&auth, leased, &mut report).await?;
-
-            report.cleaned_outbox_rows += self
-                .store
-                .cleanup_outbox(
-                    &auth,
-                    Utc::now() - Duration::hours(self.config.delivered_retention_hours),
-                    Utc::now() - Duration::hours(self.config.dead_letter_retention_hours),
-                )
-                .await
-                .map_err(map_store_worker_error)?;
-
-            report.cleaned_idempotency_rows += self
-                .store
-                .cleanup_idempotency(
-                    &auth,
-                    Utc::now() - Duration::hours(self.config.idempotency_retention_hours),
-                )
-                .await
-                .map_err(map_store_worker_error)?;
+        for (workspace_id, outcome) in per_tenant {
+            match outcome {
+                Ok(tenant_report) => {
+                    report.leased += tenant_report.leased;
+                    report.delivered += tenant_report.delivered;
+                    report.failed += tenant_report.failed;
+                    report.dead_lettered += tenant_report.dead_lettered;
+                    report.cleaned_outbox_rows += tenant_report.cleaned_outbox_rows;
+                    report.cleaned_idempotency_rows += tenant_report.cleaned_idempotency_rows;
+                }
+                Err(error) => {
+                    report.tenant_failures += 1;
+                    warn!(
+                        workspace_id = %workspace_id,
+                        error_code = error.code,
+                        "worker tenant cycle failed; continuing remaining tenants"
+                    );
+                }
+            }
         }
 
         info!(
@@ -183,10 +195,60 @@ impl OutboxWorkerService {
             delivered = report.delivered,
             failed = report.failed,
             dead_lettered = report.dead_lettered,
+            tenant_failures = report.tenant_failures,
             cleaned_outbox_rows = report.cleaned_outbox_rows,
             cleaned_idempotency_rows = report.cleaned_idempotency_rows,
             "worker run finished"
         );
+
+        Ok(report)
+    }
+
+    async fn run_tenant_cycle(
+        &self,
+        auth: &AuthContext,
+    ) -> Result<WorkerRunReport, AppServiceError> {
+        let mut report = WorkerRunReport::default();
+
+        let now = Utc::now();
+        let leased = self
+            .store
+            .lease_outbox_batch(
+                auth,
+                now,
+                Duration::seconds(self.config.lease_seconds),
+                self.config.batch_size,
+            )
+            .await
+            .map_err(map_store_worker_error)?;
+
+        info!(
+            workspace_id = %auth.workspace_id,
+            leased = leased.len(),
+            "worker leased outbox rows"
+        );
+        report.leased += leased.len();
+
+        self.process_leased(auth, leased, &mut report).await?;
+
+        report.cleaned_outbox_rows += self
+            .store
+            .cleanup_outbox(
+                auth,
+                Utc::now() - Duration::hours(self.config.delivered_retention_hours),
+                Utc::now() - Duration::hours(self.config.dead_letter_retention_hours),
+            )
+            .await
+            .map_err(map_store_worker_error)?;
+
+        report.cleaned_idempotency_rows += self
+            .store
+            .cleanup_idempotency(
+                auth,
+                Utc::now() - Duration::hours(self.config.idempotency_retention_hours),
+            )
+            .await
+            .map_err(map_store_worker_error)?;
 
         Ok(report)
     }
@@ -224,6 +286,7 @@ impl OutboxWorkerService {
                 now,
                 lease_until,
                 i64::try_from(self.config.partition_batch).unwrap_or(i64::MAX),
+                self.config.partition_shard_buckets,
             )
             .await
             .map_err(map_store_worker_error)?;
@@ -246,13 +309,15 @@ impl OutboxWorkerService {
     ) -> Result<(), AppServiceError> {
         let concurrency = self.config.publish_concurrency.max(1);
         let publisher = Arc::clone(&self.publisher);
+        let registry = Arc::clone(&self.registry);
 
         let completed: Vec<(OutboxMessage, Result<(), PublishError>)> =
             futures::stream::iter(leased)
                 .map(|message| {
                     let publisher = Arc::clone(&publisher);
+                    let registry = Arc::clone(&registry);
                     async move {
-                        let outcome = route_and_publish(publisher.as_ref(), &message).await;
+                        let outcome = registry.dispatch(publisher.as_ref(), &message).await;
                         (message, outcome)
                     }
                 })
@@ -340,33 +405,6 @@ impl OutboxWorkerService {
     }
 }
 
-async fn route_and_publish(
-    publisher: &dyn OutboxPublisher,
-    message: &OutboxMessage,
-) -> Result<(), PublishError> {
-    match EventType::parse(message.event_type.as_str()) {
-        Some(EventType::IssueCreatedV1) => {
-            let event: IssueCreatedEventV1 = serde_json::from_value(message.payload.clone())
-                .map_err(|error| PublishError {
-                    kind: PublishErrorKind::Serialization,
-                    message: format!("failed to deserialize issue.created payload: {error}"),
-                })?;
-            publisher.publish_issue_created(message, &event).await
-        }
-        Some(other) => Err(PublishError {
-            kind: PublishErrorKind::Unsupported,
-            message: format!("event type '{other}' is not yet routable by the worker"),
-        }),
-        None => Err(PublishError {
-            kind: PublishErrorKind::Unsupported,
-            message: format!(
-                "unknown outbox event type '{}' (not in domain event registry)",
-                message.event_type
-            ),
-        }),
-    }
-}
-
 pub async fn build_outbox_worker_service(
     database_url: &str,
     run_migrations: bool,
@@ -375,28 +413,16 @@ pub async fn build_outbox_worker_service(
     if run_migrations {
         migrate_database(database_url)
             .await
-            .map_err(|error| AppServiceError {
-                code: "migration_failed",
-                message: error.to_string(),
-                kind: ErrorKind::Infrastructure,
-            })?;
+            .map_err(|error| AppServiceError::internal("migration_failed", error))?;
     }
 
     let store = PgStore::connect(database_url)
         .await
-        .map_err(|error| AppServiceError {
-            code: "store_connect_failed",
-            message: error.to_string(),
-            kind: ErrorKind::Infrastructure,
-        })?;
+        .map_err(|error| AppServiceError::internal("store_connect_failed", error))?;
 
     OutboxWorkerService::with_default_publisher(store, config)
 }
 
 fn map_store_worker_error(error: dandori_store::StoreError) -> AppServiceError {
-    AppServiceError {
-        code: "worker_store_failed",
-        message: error.to_string(),
-        kind: ErrorKind::Infrastructure,
-    }
+    AppServiceError::internal("worker_store_failed", error)
 }

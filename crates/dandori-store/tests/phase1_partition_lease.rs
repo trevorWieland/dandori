@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 
 use chrono::{Duration, Utc};
+use dandori_store::ShardBucketRange;
 use dandori_test_support::setup_database;
 use uuid::Uuid;
 
@@ -26,10 +27,16 @@ async fn two_concurrent_owners_acquire_disjoint_partitions() {
 
     let store_a = store.clone();
     let store_b = store.clone();
-    let acquire_a =
-        tokio::spawn(async move { store_a.acquire_partitions(owner_a, now, until, 10).await });
-    let acquire_b =
-        tokio::spawn(async move { store_b.acquire_partitions(owner_b, now, until, 10).await });
+    let acquire_a = tokio::spawn(async move {
+        store_a
+            .acquire_partitions(owner_a, now, until, 10, ShardBucketRange::full())
+            .await
+    });
+    let acquire_b = tokio::spawn(async move {
+        store_b
+            .acquire_partitions(owner_b, now, until, 10, ShardBucketRange::full())
+            .await
+    });
 
     let claims_a: HashSet<Uuid> = acquire_a
         .await
@@ -66,7 +73,7 @@ async fn owner_can_renew_its_own_lease() {
     let now = Utc::now();
     let until = now + Duration::seconds(10);
     let claimed = store
-        .acquire_partitions(owner, now, until, 10)
+        .acquire_partitions(owner, now, until, 10, ShardBucketRange::full())
         .await
         .expect("acquire");
 
@@ -89,7 +96,13 @@ async fn expired_lease_is_taken_over_by_a_new_owner() {
     let original_now = Utc::now() - Duration::seconds(120);
     let original_until = original_now + Duration::seconds(30);
     let first_claim = store
-        .acquire_partitions(first_owner, original_now, original_until, 10)
+        .acquire_partitions(
+            first_owner,
+            original_now,
+            original_until,
+            10,
+            ShardBucketRange::full(),
+        )
         .await
         .expect("first acquire");
     assert!(!first_claim.is_empty());
@@ -97,7 +110,13 @@ async fn expired_lease_is_taken_over_by_a_new_owner() {
     let takeover_now = Utc::now();
     let takeover_until = takeover_now + Duration::seconds(30);
     let second_claim = store
-        .acquire_partitions(second_owner, takeover_now, takeover_until, 10)
+        .acquire_partitions(
+            second_owner,
+            takeover_now,
+            takeover_until,
+            10,
+            ShardBucketRange::full(),
+        )
         .await
         .expect("takeover acquire");
 
@@ -120,11 +139,11 @@ async fn releasing_partitions_is_scoped_to_current_owner() {
     let until = now + Duration::seconds(60);
 
     let claim_a = store
-        .acquire_partitions(owner_a, now, until, 1)
+        .acquire_partitions(owner_a, now, until, 1, ShardBucketRange::full())
         .await
         .expect("acquire a");
     let claim_b = store
-        .acquire_partitions(owner_b, now, until, 1)
+        .acquire_partitions(owner_b, now, until, 1, ShardBucketRange::full())
         .await
         .expect("acquire b");
 

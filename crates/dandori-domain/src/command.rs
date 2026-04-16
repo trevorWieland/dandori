@@ -255,7 +255,7 @@ mod tests {
     fn base_create_issue_command() -> CreateIssueCommandV1 {
         CreateIssueCommandV1 {
             command_id: CommandId(Uuid::now_v7()),
-            idempotency_key: IdempotencyKey("idem".to_owned()),
+            idempotency_key: IdempotencyKey::new("idem").expect("test fixture"),
             request_fingerprint: "v2:abc".to_owned(),
             issue_id: IssueId(Uuid::now_v7()),
             workspace_id: WorkspaceId(Uuid::now_v7()),

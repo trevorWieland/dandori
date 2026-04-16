@@ -4,45 +4,87 @@ use uuid::Uuid;
 
 use crate::StoreError;
 
-/// Atomically lease up to `limit` workspaces to `owner_id` using
-/// `INSERT … ON CONFLICT … DO UPDATE … WHERE leased_until <= $now`.
-/// Partitions held by other owners whose leases are still valid are
-/// skipped; expired leases are taken over.
+/// Inclusive shard-bucket window of workspaces a worker is authorized to
+/// lease. Shard buckets are `[0, 1024)` and assigned deterministically by
+/// `hashtext(workspace_id::text) % 1024` at migration time.
+#[derive(Debug, Clone, Copy)]
+pub struct ShardBucketRange {
+    min: i32,
+    max: i32,
+}
+
+impl ShardBucketRange {
+    pub const MAX_BUCKET: i32 = 1023;
+
+    pub fn new(min: i32, max: i32) -> Result<Self, StoreError> {
+        if !(0..=Self::MAX_BUCKET).contains(&min) || !(0..=Self::MAX_BUCKET).contains(&max) {
+            return Err(StoreError::InvalidInput(format!(
+                "shard bucket range {min}..{max} out of bounds [0,{}]",
+                Self::MAX_BUCKET
+            )));
+        }
+        if min > max {
+            return Err(StoreError::InvalidInput(format!(
+                "shard bucket range min ({min}) exceeds max ({max})"
+            )));
+        }
+        Ok(Self { min, max })
+    }
+
+    #[must_use]
+    pub fn full() -> Self {
+        Self {
+            min: 0,
+            max: Self::MAX_BUCKET,
+        }
+    }
+
+    #[must_use]
+    pub fn min(&self) -> i32 {
+        self.min
+    }
+
+    #[must_use]
+    pub fn max(&self) -> i32 {
+        self.max
+    }
+}
+
+/// Atomically lease up to `limit` workspaces from the given shard-bucket
+/// window to `owner_id`. Uses `INSERT … ON CONFLICT … DO UPDATE … WHERE
+/// leased_until <= $now` so racing workers converge deterministically:
+/// the winner commits first; the loser's ON CONFLICT branch only takes
+/// over the lease if it has already expired or the loser is the existing
+/// owner (a renewal). Non-qualifying rows are dropped from the RETURNING
+/// set so callers always observe the precise set they now own.
 pub(crate) async fn acquire_partitions(
     pool: &PgPool,
     owner_id: Uuid,
     now: DateTime<Utc>,
     lease_until: DateTime<Utc>,
     limit: i64,
+    buckets: ShardBucketRange,
 ) -> Result<Vec<Uuid>, StoreError> {
-    // Workspace discovery goes through a SECURITY DEFINER helper so the
-    // worker sees every tenant without granting BYPASSRLS to the app role.
-    // Concurrency is resolved by the `worker_partition_lease` PK: racing
-    // workers both pre-filter with `NOT EXISTS`, but the winner is the
-    // first to commit the INSERT; the loser's ON CONFLICT branch only
-    // accepts the takeover when the existing lease has already expired or
-    // it is the lease's own owner (renewal). Non-qualifying rows are
-    // silently dropped from the RETURNING set, so callers always observe
-    // the precise set they own after the call.
+    let scan_limit: i32 = i32::try_from(limit.min(i64::from(i32::MAX))).unwrap_or(i32::MAX);
     let rows = sqlx::query!(
         r#"WITH candidates AS (
-               SELECT w.id
-               FROM list_workspace_ids_for_partition_lease() AS w(id)
+               SELECT w.id, w.shard_bucket
+               FROM list_workspace_ids_for_partition_lease($4, $5, $6) AS w(id, shard_bucket)
                WHERE NOT EXISTS (
                    SELECT 1
                    FROM worker_partition_lease l
                    WHERE l.workspace_id = w.id
                      AND l.leased_until > $1
-                     AND l.lease_owner <> $3
+                     AND l.lease_owner <> $2
                )
-               ORDER BY w.id
-               LIMIT $2
+               ORDER BY w.shard_bucket, w.id
            )
            INSERT INTO worker_partition_lease
-               (workspace_id, lease_owner, leased_at, leased_until, updated_at)
-           SELECT id, $3, $1, $4, $1 FROM candidates
+               (workspace_id, shard_bucket, lease_owner, leased_at, leased_until, updated_at)
+           SELECT id, shard_bucket, $2, $1, $3, $1 FROM candidates
            ON CONFLICT (workspace_id) DO UPDATE
                SET lease_owner = excluded.lease_owner,
+                   shard_bucket = excluded.shard_bucket,
                    leased_at = excluded.leased_at,
                    leased_until = excluded.leased_until,
                    updated_at = excluded.updated_at
@@ -50,9 +92,11 @@ pub(crate) async fn acquire_partitions(
                   OR worker_partition_lease.lease_owner = excluded.lease_owner
            RETURNING workspace_id as "workspace_id!: Uuid""#,
         now,
-        limit,
         owner_id,
         lease_until,
+        buckets.min,
+        buckets.max,
+        scan_limit,
     )
     .fetch_all(pool)
     .await?;

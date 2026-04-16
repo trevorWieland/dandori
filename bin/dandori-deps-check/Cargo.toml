@@ -13,3 +13,4 @@ workspace = true
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+syn = { version = "2", features = ["full", "visit"] }

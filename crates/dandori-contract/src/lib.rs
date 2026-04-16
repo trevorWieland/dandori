@@ -62,6 +62,11 @@ pub struct GetIssueResponse {
 pub struct ErrorEnvelope {
     pub code: String,
     pub message: String,
+    /// Correlation id mirroring the private log line. Always populated by
+    /// the app-service layer and surfaced to the client so support can tie a
+    /// user-visible failure back to internal traces without leaking details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

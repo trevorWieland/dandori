@@ -57,3 +57,29 @@ pub enum DomainError {
     #[error(transparent)]
     Infrastructure(InfrastructureError),
 }
+
+impl DomainError {
+    #[must_use]
+    pub fn validation(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Validation(ValidationError {
+            code,
+            message: message.into(),
+        })
+    }
+
+    #[must_use]
+    pub fn authz(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Authz(AuthzError {
+            code,
+            message: message.into(),
+        })
+    }
+
+    #[must_use]
+    pub fn infrastructure(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Infrastructure(InfrastructureError {
+            code,
+            message: message.into(),
+        })
+    }
+}

@@ -7,6 +7,7 @@ pub use adapters::{
 };
 pub use dandori_domain::AuthContext;
 
+pub use dandori_store::ShardBucketRange;
 pub use service::{
     AppServiceError, ErrorKind, IssueAppService, build_issue_service, map_error_to_transport,
     validation_error,

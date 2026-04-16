@@ -14,6 +14,7 @@
 
 mod config;
 mod publish;
+mod registry;
 mod service;
 
 pub use config::{OutboxWorkerConfig, WorkerRunReport};

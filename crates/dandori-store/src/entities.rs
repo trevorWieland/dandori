@@ -7,6 +7,7 @@ pub mod workspace {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: Uuid,
         pub name: String,
+        pub shard_bucket: i16,
         pub row_version: i64,
         pub created_at: DateTimeWithTimeZone,
         pub updated_at: DateTimeWithTimeZone,
@@ -16,6 +17,18 @@ pub mod workspace {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
+
+    /// Deterministic bucket assignment from a workspace UUID.
+    ///
+    /// Uses the trailing 16 bits of the v4/v7 UUID (which are uniformly
+    /// random for v4 and include a random tail for v7), clamped to the
+    /// 0..=1023 range that matches the migration check constraint.
+    #[must_use]
+    pub fn shard_bucket_for(id: Uuid) -> i16 {
+        let bytes = id.as_bytes();
+        let tail = u16::from_be_bytes([bytes[14], bytes[15]]);
+        (tail % 1024) as i16
+    }
 }
 
 pub mod workflow_version {

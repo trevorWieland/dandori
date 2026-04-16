@@ -7,6 +7,7 @@ use dandori_contract::{Envelope, ErrorEnvelope};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct McpState {
@@ -81,11 +82,17 @@ impl McpState {
                 actor_id: claims.actor_id,
             },
             Err(error) => {
-                tracing::warn!(error = ?error, "mcp authentication failed");
+                let correlation_id = Uuid::now_v7();
+                tracing::warn!(
+                    correlation_id = %correlation_id,
+                    error = ?error,
+                    "mcp authentication failed"
+                );
                 return Envelope::Err {
                     error: ErrorEnvelope {
                         code: "unauthorized".to_owned(),
                         message: "authentication failed".to_owned(),
+                        correlation_id: Some(correlation_id),
                     },
                 };
             }
@@ -98,6 +105,7 @@ impl McpState {
                 error: ErrorEnvelope {
                     code: "unknown_tool".to_owned(),
                     message: format!("unknown MCP tool '{tool_name}'"),
+                    correlation_id: Some(Uuid::now_v7()),
                 },
             },
         }

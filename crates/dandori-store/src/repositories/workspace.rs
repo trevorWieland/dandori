@@ -18,6 +18,7 @@ pub(crate) async fn create_workspace(
     let model = workspace::ActiveModel {
         id: Set(input.workspace_id),
         name: Set(input.name),
+        shard_bucket: Set(workspace::shard_bucket_for(input.workspace_id)),
         ..Default::default()
     }
     .insert(&tx)

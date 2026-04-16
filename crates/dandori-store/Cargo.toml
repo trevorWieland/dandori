@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 chrono = { workspace = true }
 dandori-domain = { path = "../dandori-domain", version = "0.1.0" }
+dandori-observability = { path = "../dandori-observability", version = "0.1.0" }
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
 serde = { workspace = true }

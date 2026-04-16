@@ -111,6 +111,7 @@ fn map_transport_error<T>(error: AppServiceError) -> (u16, Envelope<T>) {
             error: ErrorEnvelope {
                 code: error.code.to_owned(),
                 message: error.message,
+                correlation_id: Some(error.correlation_id),
             },
         },
     )

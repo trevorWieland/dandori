@@ -459,6 +459,8 @@ dependencies = [
  "chrono",
  "dandori-contract",
  "dandori-domain",
+ "dandori-observability",
+ "dandori-policy",
  "dandori-store",
  "dandori-test-support",
  "futures",
@@ -511,6 +513,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "syn",
 ]
 
 [[package]]
@@ -519,6 +522,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "serde",
+ "serde_json",
  "thiserror",
  "uuid",
 ]
@@ -574,6 +578,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -601,6 +607,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dandori-domain",
+ "dandori-observability",
  "dandori-test-support",
  "futures",
  "sea-orm",

@@ -9,58 +9,58 @@ use uuid::Uuid;
 use crate::pg_store::{CreateIssueWriteResult, IdempotencyResponse, PgStore};
 use crate::{StoreError, repositories::common::set_workspace_context_tx};
 
-/// Full issue-create write path. Idempotency is reserved atomically through
-/// `INSERT … ON CONFLICT … RETURNING`; the `(xmax = 0)` sentinel tells us
-/// whether this transaction won the race (fresh write) or lost it (replay
-/// / conflict), making the behaviour deterministic under concurrency.
+/// Full issue-create write path. Idempotency is reserved atomically as the
+/// **first** statement in the transaction, with a placeholder payload. The
+/// `(xmax = 0)` sentinel from the `INSERT … ON CONFLICT … RETURNING` tells
+/// us whether this transaction won the race (proceeds with writes) or lost
+/// it (short-circuits with the stored replay payload). There is no
+/// pre-read round-trip and no write-then-rollback on races.
 pub(crate) async fn create_issue_transactional(
     store: &PgStore,
     auth: &AuthContext,
     command: &CreateIssueCommandV1,
     event: &IssueCreatedEventV1,
 ) -> Result<CreateIssueWriteResult, StoreError> {
-    if let Some(existing) = read_existing_idempotency(store, auth, command).await? {
-        return resolve_existing_idempotency(existing, command);
-    }
-
     let occurred_at = event.occurred_at.fixed_offset();
     let idempotency_now = Utc::now().fixed_offset();
     let idempotency_expires = (Utc::now() + Duration::days(7)).fixed_offset();
+    let placeholder_payload = serde_json::json!({ "status": "reserving" });
 
     let mut tx = store.pool().begin().await?;
     set_workspace_context_tx(&mut tx, auth.workspace_id.0).await?;
 
-    ensure_project_exists(&mut tx, command).await?;
-    ensure_milestone_belongs_to_project(&mut tx, command).await?;
-
-    insert_issue(&mut tx, command, occurred_at).await?;
-    insert_activity(&mut tx, command, event, occurred_at).await?;
-    insert_outbox(&mut tx, command, event, occurred_at).await?;
-
-    let response_payload = serde_json::to_value(IdempotencyResponse {
-        issue: fetch_issue_in_tx(&mut tx, command.issue_id.0)
-            .await?
-            .ok_or(StoreError::IdempotencyReplayMissingIssue)?,
-    })?;
-
     let reservation = reserve_idempotency(
         &mut tx,
         command,
-        &response_payload,
+        &placeholder_payload,
         idempotency_now,
         idempotency_expires,
     )
     .await?;
 
     if !reservation.inserted {
-        // We lost the race. Roll back this transaction's issue/outbox/activity
-        // writes and map to a deterministic replay or conflict based on the
-        // fingerprint already stored by the winning transaction.
-        tx.rollback().await?;
+        // Race loss path: no writes have happened yet, so we just short-circuit
+        // based on whether the fingerprint of this request matches the winner.
+        tx.commit().await?;
+        dandori_observability::metrics::increment_counter(
+            dandori_observability::metrics::names::STORE_IDEMPOTENCY_REPLAY,
+            1,
+        );
         return branch_on_stored_fingerprint(command, reservation);
     }
 
-    let issue: Issue = serde_json::from_value::<IdempotencyResponse>(response_payload)?.issue;
+    ensure_project_exists(&mut tx, command).await?;
+    ensure_milestone_belongs_to_project(&mut tx, command).await?;
+
+    let issue = insert_issue_returning(&mut tx, command, occurred_at).await?;
+    insert_activity(&mut tx, command, event, occurred_at).await?;
+    insert_outbox(&mut tx, command, event, occurred_at).await?;
+
+    let final_payload = serde_json::to_value(IdempotencyResponse {
+        issue: issue.clone(),
+    })?;
+    update_idempotency_payload(&mut tx, command, &final_payload).await?;
+
     tx.commit().await?;
     Ok(CreateIssueWriteResult {
         issue,
@@ -78,51 +78,6 @@ pub(crate) async fn get_issue(
     let issue = fetch_issue_in_tx(&mut tx, issue_id).await?;
     tx.commit().await?;
     Ok(issue)
-}
-
-struct ExistingIdempotencyRecord {
-    request_fingerprint: String,
-    response_payload: serde_json::Value,
-}
-
-async fn read_existing_idempotency(
-    store: &PgStore,
-    auth: &AuthContext,
-    command: &CreateIssueCommandV1,
-) -> Result<Option<ExistingIdempotencyRecord>, StoreError> {
-    let mut tx = store.pool().begin().await?;
-    set_workspace_context_tx(&mut tx, auth.workspace_id.0).await?;
-    let row = sqlx::query!(
-        r#"SELECT request_fingerprint, response_payload as "response_payload!: serde_json::Value"
-           FROM idempotency_record
-           WHERE workspace_id = $1
-             AND command_name = $2
-             AND idempotency_key = $3"#,
-        command.workspace_id.0,
-        CommandName::IssueCreateV1.as_str(),
-        command.idempotency_key.as_str(),
-    )
-    .fetch_optional(tx.as_mut())
-    .await?;
-    tx.commit().await?;
-    Ok(row.map(|row| ExistingIdempotencyRecord {
-        request_fingerprint: row.request_fingerprint,
-        response_payload: row.response_payload,
-    }))
-}
-
-fn resolve_existing_idempotency(
-    existing: ExistingIdempotencyRecord,
-    command: &CreateIssueCommandV1,
-) -> Result<CreateIssueWriteResult, StoreError> {
-    if !matches_request_fingerprint(existing.request_fingerprint.as_str(), command) {
-        return Err(StoreError::IdempotencyConflict);
-    }
-    let replay: IdempotencyResponse = serde_json::from_value(existing.response_payload)?;
-    Ok(CreateIssueWriteResult {
-        issue: replay.issue,
-        idempotent_replay: true,
-    })
 }
 
 async fn ensure_project_exists(
@@ -169,14 +124,15 @@ async fn ensure_milestone_belongs_to_project(
     Ok(())
 }
 
-async fn insert_issue(
+async fn insert_issue_returning(
     tx: &mut Transaction<'_, Postgres>,
     command: &CreateIssueCommandV1,
     occurred_at: DateTime<FixedOffset>,
-) -> Result<(), StoreError> {
+) -> Result<Issue, StoreError> {
     let priority_text = priority_as_str(command.priority).to_owned();
     let milestone_id = command.milestone_id.map(|value| value.0);
-    sqlx::query!(
+    let row = sqlx::query_as!(
+        IssueRow,
         r#"INSERT INTO issue (
                id,
                workspace_id,
@@ -203,7 +159,20 @@ async fn insert_issue(
                0,
                $8,
                $8
-           )"#,
+           )
+           RETURNING
+               id as "id!: Uuid",
+               workspace_id as "workspace_id!: Uuid",
+               project_id as "project_id!: Uuid",
+               milestone_id as "milestone_id: Uuid",
+               title,
+               description,
+               state_category::text as "state_category!",
+               priority::text as "priority!",
+               archived_at as "archived_at: DateTime<FixedOffset>",
+               row_version,
+               created_at as "created_at!: DateTime<FixedOffset>",
+               updated_at as "updated_at!: DateTime<FixedOffset>""#,
         command.issue_id.0,
         command.workspace_id.0,
         command.project_id.0,
@@ -213,9 +182,9 @@ async fn insert_issue(
         priority_text,
         occurred_at,
     )
-    .execute(tx.as_mut())
+    .fetch_one(tx.as_mut())
     .await?;
-    Ok(())
+    map_issue_row(row)
 }
 
 async fn insert_activity(
@@ -381,6 +350,27 @@ fn branch_on_stored_fingerprint(
         issue: replay.issue,
         idempotent_replay: true,
     })
+}
+
+async fn update_idempotency_payload(
+    tx: &mut Transaction<'_, Postgres>,
+    command: &CreateIssueCommandV1,
+    response_payload: &serde_json::Value,
+) -> Result<(), StoreError> {
+    sqlx::query!(
+        r#"UPDATE idempotency_record
+           SET response_payload = $4
+           WHERE workspace_id = $1
+             AND command_name = $2
+             AND idempotency_key = $3"#,
+        command.workspace_id.0,
+        CommandName::IssueCreateV1.as_str(),
+        command.idempotency_key.as_str(),
+        response_payload,
+    )
+    .execute(tx.as_mut())
+    .await?;
+    Ok(())
 }
 
 struct IssueRow {

@@ -15,7 +15,7 @@ use dandori_domain::{
     AuthContext, CommandId, CreateIssueCommandV1, IdempotencyKey, IssueCreatedEventV1, IssueId,
     IssuePriority,
 };
-use dandori_store::{OutboxMessage, PgStore, migrate_database};
+use dandori_store::{OutboxMessage, PgStore, migrate_database, shard_bucket_for};
 use sqlx::PgPool;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -66,12 +66,17 @@ pub async fn setup_database() -> TestDatabase {
     let project_a = Uuid::now_v7();
     let project_b = Uuid::now_v7();
 
-    sqlx::query("INSERT INTO workspace (id, name) VALUES ($1, 'ws-a'), ($2, 'ws-b')")
-        .bind(workspace_a)
-        .bind(workspace_b)
-        .execute(&admin_pool)
-        .await
-        .expect("seed workspace");
+    sqlx::query(
+        "INSERT INTO workspace (id, name, shard_bucket)
+         VALUES ($1, 'ws-a', $3), ($2, 'ws-b', $4)",
+    )
+    .bind(workspace_a)
+    .bind(workspace_b)
+    .bind(shard_bucket_for(workspace_a))
+    .bind(shard_bucket_for(workspace_b))
+    .execute(&admin_pool)
+    .await
+    .expect("seed workspace");
 
     sqlx::query(
         "INSERT INTO workflow_version (id, workspace_id, name, version, checksum, states, transitions)
@@ -156,7 +161,7 @@ async fn create_app_role(admin_pool: &PgPool) {
     .expect("grant table perms");
 
     sqlx::query(
-        "GRANT EXECUTE ON FUNCTION list_workspace_ids_for_partition_lease() TO dandori_app",
+        "GRANT EXECUTE ON FUNCTION list_workspace_ids_for_partition_lease(integer, integer, integer) TO dandori_app",
     )
     .execute(admin_pool)
     .await
@@ -175,7 +180,7 @@ pub fn make_create_issue_command(
 ) -> CreateIssueCommandV1 {
     CreateIssueCommandV1 {
         command_id: CommandId(command_id),
-        idempotency_key: IdempotencyKey(idempotency_key.to_owned()),
+        idempotency_key: IdempotencyKey::new(idempotency_key).expect("valid idempotency key"),
         request_fingerprint: format!("fingerprint:{workspace_id}:{project_id}:{idempotency_key}"),
         issue_id: IssueId(issue_id),
         workspace_id: workspace_id.into(),

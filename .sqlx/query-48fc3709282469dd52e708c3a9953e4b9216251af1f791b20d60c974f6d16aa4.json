@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE idempotency_record\n           SET response_payload = $4\n           WHERE workspace_id = $1\n             AND command_name = $2\n             AND idempotency_key = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "48fc3709282469dd52e708c3a9953e4b9216251af1f791b20d60c974f6d16aa4"
+}

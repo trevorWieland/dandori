@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::Utc;
 use dandori_contract::{
     CreateIssueRequest, CreateIssueResponse, ErrorEnvelope, GetIssueResponse, IssueDto,
@@ -7,15 +9,24 @@ use dandori_domain::{
     AuthContext, CommandId, CreateIssueCommandV1, DomainError, IssueId, IssuePriority,
     IssueStateCategory,
 };
+use dandori_policy::{Action, PolicyEngine, Resource, RoleMatrixPolicy, Subject};
 use dandori_store::{PgStore, StoreError, migrate_database};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tracing::error;
 use uuid::Uuid;
+
+/// Public-facing message used for every internal/infrastructure error. The
+/// real detail is emitted via `tracing::error!` with the correlation id so
+/// operators can correlate client-visible failures with private logs without
+/// leaking DB internals to callers.
+const INTERNAL_ERROR_PUBLIC_MESSAGE: &str = "an internal error occurred";
 
 #[derive(Debug, Clone)]
 pub struct IssueAppService {
     store: PgStore,
+    policy: Arc<dyn PolicyEngine>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,12 +46,91 @@ pub struct AppServiceError {
     pub code: &'static str,
     pub message: String,
     pub kind: ErrorKind,
+    /// Correlation id attached to every error so operators can tie the
+    /// public envelope (which may carry a sanitized message) to the private
+    /// structured log line carrying the full detail.
+    pub correlation_id: Uuid,
+}
+
+impl AppServiceError {
+    #[must_use]
+    pub fn validation(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            kind: ErrorKind::Validation,
+            correlation_id: Uuid::now_v7(),
+        }
+    }
+
+    /// Build a sanitized infrastructure error. The public `message` is the
+    /// constant `INTERNAL_ERROR_PUBLIC_MESSAGE`; the detailed cause is logged
+    /// via `tracing::error!` keyed on the fresh correlation id so operators
+    /// can trace back without any client ever seeing internals.
+    #[must_use]
+    pub fn internal(code: &'static str, private_source: impl std::fmt::Display) -> Self {
+        let correlation_id = Uuid::now_v7();
+        error!(
+            correlation_id = %correlation_id,
+            error_code = code,
+            detail = %private_source,
+            "internal error sanitized at app-service boundary"
+        );
+        Self {
+            code,
+            message: INTERNAL_ERROR_PUBLIC_MESSAGE.to_owned(),
+            kind: ErrorKind::Infrastructure,
+            correlation_id,
+        }
+    }
 }
 
 impl IssueAppService {
     #[must_use]
     pub fn new(store: PgStore) -> Self {
-        Self { store }
+        Self::with_policy(store, Arc::new(RoleMatrixPolicy::standard()))
+    }
+
+    #[must_use]
+    pub fn with_policy(store: PgStore, policy: Arc<dyn PolicyEngine>) -> Self {
+        Self { store, policy }
+    }
+
+    fn subject_from_auth(auth: &AuthContext) -> Subject {
+        // Callers authenticated at the transport boundary are treated as
+        // full Members of their workspace. This matches Phase 1 scope
+        // (single-tier tenancy) and will tighten when RBAC lands — the
+        // transport layer is then the only place that needs to change to
+        // surface richer role claims.
+        Subject::new(
+            auth.actor_id,
+            auth.workspace_id.0,
+            [dandori_policy::Role::Owner, dandori_policy::Role::Member],
+        )
+    }
+
+    fn enforce_policy(
+        &self,
+        auth: &AuthContext,
+        action: Action,
+        resource: Resource,
+    ) -> Result<(), AppServiceError> {
+        let subject = Self::subject_from_auth(auth);
+        self.policy
+            .evaluate(Some(&subject), action, resource)
+            .into_result()
+            .map_err(|err| {
+                dandori_observability::metrics::increment_counter(
+                    dandori_observability::metrics::names::API_AUTHZ_DENIED,
+                    1,
+                );
+                AppServiceError {
+                    code: err.0.code(),
+                    message: err.0.message().to_owned(),
+                    kind: ErrorKind::Authz,
+                    correlation_id: Uuid::now_v7(),
+                }
+            })
     }
 
     pub async fn create_issue(
@@ -48,10 +138,19 @@ impl IssueAppService {
         auth: &AuthContext,
         request: CreateIssueRequest,
     ) -> Result<CreateIssueResponse, AppServiceError> {
+        self.enforce_policy(
+            auth,
+            Action::IssueCreate,
+            Resource::Workspace {
+                workspace_id: auth.workspace_id.0,
+            },
+        )?;
         let request_fingerprint = create_issue_fingerprint(&request)?;
+        let idempotency_key = dandori_domain::IdempotencyKey::new(request.idempotency_key)
+            .map_err(Self::map_domain_error)?;
         let command = CreateIssueCommandV1 {
             command_id: CommandId(Uuid::now_v7()),
-            idempotency_key: dandori_domain::IdempotencyKey(request.idempotency_key),
+            idempotency_key,
             request_fingerprint,
             issue_id: IssueId::new(),
             workspace_id: auth.workspace_id,
@@ -97,6 +196,14 @@ impl IssueAppService {
         auth: &AuthContext,
         issue_id: Uuid,
     ) -> Result<GetIssueResponse, AppServiceError> {
+        self.enforce_policy(
+            auth,
+            Action::IssueRead,
+            Resource::Issue {
+                workspace_id: auth.workspace_id.0,
+                issue_id,
+            },
+        )?;
         let issue = self
             .store
             .get_issue(auth, issue_id)
@@ -106,6 +213,7 @@ impl IssueAppService {
                 code: "issue_not_found",
                 message: format!("issue '{issue_id}' was not found"),
                 kind: ErrorKind::NotFound,
+                correlation_id: Uuid::now_v7(),
             })?;
 
         Ok(GetIssueResponse {
@@ -114,37 +222,43 @@ impl IssueAppService {
     }
 
     fn map_domain_error(error: DomainError) -> AppServiceError {
+        let correlation_id = Uuid::now_v7();
         match error {
             DomainError::Validation(inner) => AppServiceError {
                 code: inner.code,
                 message: inner.message,
                 kind: ErrorKind::Validation,
+                correlation_id,
             },
             DomainError::Precondition(inner) => AppServiceError {
                 code: inner.code,
                 message: inner.message,
                 kind: ErrorKind::Precondition,
+                correlation_id,
             },
             DomainError::Conflict(inner) => AppServiceError {
                 code: inner.code,
                 message: inner.message,
                 kind: ErrorKind::Conflict,
+                correlation_id,
             },
             DomainError::Authz(inner) => AppServiceError {
                 code: inner.code,
                 message: inner.message,
                 kind: ErrorKind::Authz,
+                correlation_id,
             },
             DomainError::TenantBoundary(inner) => AppServiceError {
                 code: inner.code,
                 message: inner.message,
                 kind: ErrorKind::TenantBoundary,
+                correlation_id,
             },
-            DomainError::Infrastructure(inner) => AppServiceError {
-                code: inner.code,
-                message: inner.message,
-                kind: ErrorKind::Infrastructure,
-            },
+            DomainError::Infrastructure(inner) => {
+                // Infrastructure DomainErrors carry internal detail that must
+                // not reach clients. Sanitize while logging the original.
+                AppServiceError::internal(inner.code, inner.message)
+            }
         }
     }
 
@@ -157,32 +271,26 @@ impl IssueAppService {
                 code: "milestone_not_found",
                 message: "milestone not found in workspace".to_owned(),
                 kind: ErrorKind::Precondition,
+                correlation_id: Uuid::now_v7(),
             },
             StoreError::MilestoneProjectMismatch => AppServiceError {
                 code: "milestone_project_mismatch",
                 message: "milestone does not belong to the requested project".to_owned(),
                 kind: ErrorKind::Precondition,
+                correlation_id: Uuid::now_v7(),
             },
             StoreError::IdempotencyConflict => {
                 Self::map_domain_error(command.map_duplicate_conflict())
             }
             StoreError::Domain(domain) => Self::map_domain_error(domain),
-            other => AppServiceError {
-                code: "store_write_failed",
-                message: other.to_string(),
-                kind: ErrorKind::Infrastructure,
-            },
+            other => AppServiceError::internal("store_write_failed", other),
         }
     }
 
-    fn map_store_error_read(error: StoreError, issue_id: Uuid) -> AppServiceError {
+    fn map_store_error_read(error: StoreError, _issue_id: Uuid) -> AppServiceError {
         match error {
             StoreError::Domain(domain) => Self::map_domain_error(domain),
-            other => AppServiceError {
-                code: "store_read_failed",
-                message: format!("failed to read issue '{issue_id}': {other}"),
-                kind: ErrorKind::Infrastructure,
-            },
+            other => AppServiceError::internal("store_read_failed", other),
         }
     }
 }
@@ -194,20 +302,12 @@ pub async fn build_issue_service(
     if run_migrations {
         migrate_database(database_url)
             .await
-            .map_err(|error| AppServiceError {
-                code: "migration_failed",
-                message: error.to_string(),
-                kind: ErrorKind::Infrastructure,
-            })?;
+            .map_err(|error| AppServiceError::internal("migration_failed", error))?;
     }
 
     let store = PgStore::connect(database_url)
         .await
-        .map_err(|error| AppServiceError {
-            code: "store_connect_failed",
-            message: error.to_string(),
-            kind: ErrorKind::Infrastructure,
-        })?;
+        .map_err(|error| AppServiceError::internal("store_connect_failed", error))?;
 
     Ok(IssueAppService::new(store))
 }
@@ -217,6 +317,7 @@ pub fn map_error_to_transport(error: AppServiceError) -> ErrorEnvelope {
     ErrorEnvelope {
         code: error.code.to_owned(),
         message: error.message,
+        correlation_id: Some(error.correlation_id),
     }
 }
 
@@ -266,11 +367,7 @@ fn map_issue_to_dto(issue: dandori_domain::Issue) -> IssueDto {
 
 #[must_use]
 pub fn validation_error(code: &'static str, message: String) -> AppServiceError {
-    AppServiceError {
-        code,
-        message,
-        kind: ErrorKind::Validation,
-    }
+    AppServiceError::validation(code, message)
 }
 
 fn create_issue_fingerprint(request: &CreateIssueRequest) -> Result<String, AppServiceError> {
@@ -293,11 +390,8 @@ fn create_issue_fingerprint(request: &CreateIssueRequest) -> Result<String, AppS
         priority: priority_literal(request.priority),
     };
 
-    let bytes = serde_json::to_vec(&payload).map_err(|error| AppServiceError {
-        code: "fingerprint_serialize_failed",
-        message: format!("failed to serialize idempotency fingerprint payload: {error}"),
-        kind: ErrorKind::Infrastructure,
-    })?;
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|error| AppServiceError::internal("fingerprint_serialize_failed", error))?;
 
     let digest = Sha256::digest(bytes);
     Ok(format!("v2:{}", hex::encode(digest)))

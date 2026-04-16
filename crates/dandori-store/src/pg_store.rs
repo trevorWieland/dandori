@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 use crate::repositories::{issue, outbox, partition, project, workspace};
 
+pub use crate::repositories::partition::ShardBucketRange;
+
 #[derive(Debug, Clone)]
 pub struct PgStore {
     pool: PgPool,
@@ -149,6 +151,8 @@ pub enum StoreError {
     },
     #[error("domain violation: {0}")]
     Domain(#[from] DomainError),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -274,18 +278,19 @@ impl PgStore {
         outbox::cleanup_idempotency(self, auth, expires_before).await
     }
 
-    /// Atomically lease workspaces for this worker. Partitions held by
-    /// another worker with a still-valid lease are skipped; expired leases
-    /// are taken over. Callers must treat the returned list as definitive
-    /// ownership for the lease window.
+    /// Atomically lease workspaces for this worker from a bounded shard-bucket
+    /// window. Partitions held by another worker with a still-valid lease are
+    /// skipped; expired leases are taken over. Callers must treat the returned
+    /// list as definitive ownership for the lease window.
     pub async fn acquire_partitions(
         &self,
         owner_id: Uuid,
         now: DateTime<Utc>,
         lease_until: DateTime<Utc>,
         limit: i64,
+        buckets: ShardBucketRange,
     ) -> Result<Vec<Uuid>, StoreError> {
-        partition::acquire_partitions(&self.pool, owner_id, now, lease_until, limit).await
+        partition::acquire_partitions(&self.pool, owner_id, now, lease_until, limit, buckets).await
     }
 
     /// Extend the lease window on partitions currently owned by `owner_id`.

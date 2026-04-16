@@ -1,3 +1,4 @@
+use dandori_store::ShardBucketRange;
 use uuid::Uuid;
 
 /// Full configuration surface for the outbox worker. All knobs that affect
@@ -37,6 +38,13 @@ pub struct OutboxWorkerConfig {
     pub partition_batch: usize,
     /// Lease duration applied to partition claims.
     pub partition_lease_seconds: i64,
+    /// Shard-bucket window this worker is authorized to lease. Production
+    /// fleets shard by passing non-overlapping ranges per pod; a single
+    /// worker defaults to the full range.
+    pub partition_shard_buckets: ShardBucketRange,
+    /// Maximum number of tenant partitions processed concurrently in a single
+    /// worker cycle. Bounded 1..=256; defaults to 8.
+    pub tenant_max_concurrency: usize,
 }
 
 impl Default for OutboxWorkerConfig {
@@ -60,6 +68,8 @@ impl Default for OutboxWorkerConfig {
             circuit_cooldown_seconds: 30,
             partition_batch: 64,
             partition_lease_seconds: 60,
+            partition_shard_buckets: ShardBucketRange::full(),
+            tenant_max_concurrency: 8,
         }
     }
 }
@@ -73,4 +83,8 @@ pub struct WorkerRunReport {
     pub dead_lettered: usize,
     pub cleaned_outbox_rows: u64,
     pub cleaned_idempotency_rows: u64,
+    /// Number of tenant cycles that returned an error and were isolated from
+    /// the rest of the cycle. Non-zero means the worker continued past a
+    /// failing tenant rather than aborting the run.
+    pub tenant_failures: usize,
 }

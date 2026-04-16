@@ -150,6 +150,7 @@ fn transport_err<T>(
             error: dandori_contract::ErrorEnvelope {
                 code: code.to_owned(),
                 message,
+                correlation_id: Some(Uuid::now_v7()),
             },
         }),
     )
